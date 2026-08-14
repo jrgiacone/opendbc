@@ -1,0 +1,39 @@
+diff --git a/opendbc/car/honda/hondacan.py b/opendbc/car/honda/hondacan.py
+index acb4dd1c..7b507df9 100644
+--- a/opendbc/car/honda/hondacan.py
++++ b/opendbc/car/honda/hondacan.py
+@@ -84,12 +84,12 @@ def create_acc_commands(packer, CAN, enabled, active, accel, gas, stopping_count
+   acc_control_values = {
+     'ACCEL_COMMAND': accel_command,
+     'STANDSTILL': standstill,
++    'BRAKE_REQUEST': braking,
+   }
+ 
+   if CP.flags & HondaFlags.BOSCH_RADARLESS:
+     acc_control_values.update({
+       "CONTROL_ON": enabled,
+-      "IDLESTOP_ALLOW": stopping_counter > 200,  # allow idle stop after 4 seconds (50 Hz)
+     })
+   else:
+     acc_control_values.update({
+@@ -97,7 +97,6 @@ def create_acc_commands(packer, CAN, enabled, active, accel, gas, stopping_count
+       "CONTROL_ON": control_on,
+       "GAS_COMMAND": gas_command,  # used for gas
+       "BRAKE_LIGHTS": braking,
+-      "BRAKE_REQUEST": braking,
+       "STANDSTILL_RELEASE": standstill_release,
+     })
+     acc_control_on_values = {
+diff --git a/opendbc/dbc/generator/honda/honda_bosch_radarless.dbc b/opendbc/dbc/generator/honda/honda_bosch_radarless.dbc
+index dc3510f1..ec7a2d5f 100644
+--- a/opendbc/dbc/generator/honda/honda_bosch_radarless.dbc
++++ b/opendbc/dbc/generator/honda/honda_bosch_radarless.dbc
+@@ -7,7 +7,7 @@ CM_ "IMPORT _gearbox_common.dbc";
+ 
+ BO_ 456 ACC_CONTROL: 8 XXX
+  SG_ ACCEL_COMMAND : 7|12@0- (0.01,0) [0|0] "m/s^2" XXX
+- SG_ IDLESTOP_ALLOW : 8|1@0+ (1,0) [0|1] "" XXX
++ SG_ BRAKE_REQUEST : 8|1@0+ (1,0) [0|1] "" XXX
+  SG_ STANDSTILL : 9|1@0+ (1,0) [0|1] "" XXX
+  SG_ CONTROL_ON : 10|1@0+ (1,0) [0|1] "" XXX
+  SG_ BOH : 23|1@0+ (1,0) [0|1] "" XXX
