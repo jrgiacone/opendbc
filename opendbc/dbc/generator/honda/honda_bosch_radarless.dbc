@@ -7,7 +7,7 @@ CM_ "IMPORT _gearbox_common.dbc";
 
 BO_ 456 ACC_CONTROL: 8 XXX
  SG_ ACCEL_COMMAND : 7|12@0- (0.01,0) [0|0] "m/s^2" XXX
- SG_ IDLESTOP_ALLOW : 8|1@0+ (1,0) [0|1] "" XXX
+ SG_ COMPUTER_BRAKE_ASSIST : 8|1@0+ (1,0) [0|1] "" XXX
  SG_ STANDSTILL : 9|1@0+ (1,0) [0|1] "" XXX
  SG_ CONTROL_ON : 10|1@0+ (1,0) [0|1] "" XXX
  SG_ BOH : 23|1@0+ (1,0) [0|1] "" XXX
@@ -44,7 +44,7 @@ BO_ 254913108 LKAS_HUD_2: 8 ADAS
  SG_ COUNTER : 61|2@0+ (1,0) [0|3] "" XXX
  SG_ CHECKSUM : 59|4@0+ (1,0) [0|15] "" XXX
 
-CM_ SG_ 456 IDLESTOP_ALLOW "allows car to turn off engine at a standstill";
+CM_ SG_ 456 COMPUTER_BRAKE_ASSIST "required whenever braking on hybrid/alt brake, otherwise allows car to turn off engine at a standstill";
 CM_ SG_ 456 STANDSTILL "set to 1 when camera requests -4.0 m/s^2";
 CM_ SG_ 495 SPEED_LIMIT "Defaults to 0xFF if no speed limit found";
 

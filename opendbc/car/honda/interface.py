@@ -86,9 +86,13 @@ class CarInterface(CarInterfaceBase):
     ret.steerActuatorDelay = 0.1
 
     if ret.flags & HondaFlags.BOSCH:
-      ret.longitudinalActuatorDelay = 0.5 # s
       if ret.flags & HondaFlags.BOSCH_RADARLESS:
         ret.stopAccel = CarControllerParams.BOSCH_ACCEL_MIN  # stock uses -4.0 m/s^2 once stopped but limited by safety model
+        ret.longitudinalActuatorDelay = 0.25  # s, brake actuator is faster on radarless
+      elif ret.flags & HondaFlags.BOSCH_CANFD:
+        ret.longitudinalActuatorDelay = 0.05  # s, near zero, CAN FD seems to have stock feedforward correction
+      else:
+        ret.longitudinalActuatorDelay = 0.5  # s
     else:
       # default longitudinal tuning for all hondas
       ret.longitudinalTuning.kiBP = [0., 5., 35.]
