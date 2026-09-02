@@ -44,7 +44,7 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
-MODEL_VERSION = 1
+MODEL_VERSION = 2
 
 # --- sample gating -------------------------------------------------------------------
 MIN_LEARN_SPEED = 8.0          # m/s, below this Honda EPS assist is too nonlinear to fit
@@ -76,6 +76,15 @@ MIN_TOTAL_POINTS = 600         # before the model as a whole reports ``valid``
 
 FORGETTING_FACTOR = 0.99995    # ~20 min half life at 100 Hz: tracks tire/temperature drift
 
+# Resuming from a cached model restores how sure it was, not just what it thought, but not
+# quite in full: tires, alignment, load and temperature can all change between ignitions,
+# and a learner that resumes at full confidence cannot notice. Inflating the covariance
+# re-opens it just enough to move if the car has.
+RESTART_COVARIANCE_INFLATION = 2.0
+# the delay bank re-races from scratch each drive; until it has run enough candidates to
+# mean anything, report the delay we resumed with rather than a half finished race
+DELAY_MIN_UPDATES = 200
+
 # --- delay estimation ----------------------------------------------------------------
 # The dead time is identified by fitting the same model at a bank of candidate delays and
 # keeping the one that explains the command best. Cross correlating command with steering
@@ -88,6 +97,15 @@ DELAY_BANK_DECIMATION = 10     # only every Nth usable sample updates the bank: 
                                # dead time converges over minutes, not seconds
 DELAY_RESIDUAL_TAU = 2000.0    # samples of residual averaging per candidate
 
+
+
+def speed_bucket_centres() -> list[float]:
+  """The speed each bucket's gain estimate is reported at."""
+  out = []
+  for i in range(len(SPEED_BUCKET_EDGES) - 1):
+    lo, hi = SPEED_BUCKET_EDGES[i], SPEED_BUCKET_EDGES[i + 1]
+    out.append(lo if i == 0 else (lo + min(hi, 40.0)) / 2.0)
+  return out
 
 
 def _bucket_index(value: float, edges) -> int:
@@ -149,10 +167,17 @@ class HondaSteeringModel:
   understeer_gradient: float = 0.0  # rad of extra steer per m/s^2, at the road wheel
   driver_torque_threshold: float = 1200.0
 
-  # bookkeeping
+  # bookkeeping. ``points`` is a lifetime count across every drive that fed this model,
+  # not a count for the current one.
   points: int = 0
   learned_buckets: int = 0
   valid: bool = False
+
+  # Enough state to resume rather than restart. ``bucket_counts`` is which speed and
+  # lateral acceleration cells have been covered; ``covariance`` is how sure each fit was.
+  # Neither is published: they are for the next ignition, not for reading.
+  bucket_counts: list[list[int]] = field(default_factory=list)
+  covariance: dict = field(default_factory=dict)
 
   @property
   def effective_lag(self) -> float:
@@ -293,7 +318,10 @@ class _DelayBank:
       self.residual[i] = err if np.isnan(self.residual[i]) else self.residual[i] + k * (err - self.residual[i])
       self.rls[i].update(x, y)
 
-    if np.isnan(self.residual).all():
+    # Until enough candidates have been scored on enough samples, the race is noise: on a
+    # resumed model that would replace a delay learned over hours with one scored over
+    # seconds, and on a fresh one it would swing the estimate around early in a drive.
+    if np.isnan(self.residual).all() or self.n < DELAY_MIN_UPDATES:
       return
     self.best = int(np.nanargmin(self.residual))
     self.delay = self._interpolated()
@@ -370,11 +398,23 @@ class HondaSteeringLearner:
     self.delay_bank = _DelayBank(theta0, p0, seed.actuator_delay, dt)
     # static model: theta = [1/K, friction, offset, asymmetry], fitted on settled samples
     self.steady_rls = _RLS(theta0[:4], p0[:4])
-    self.speed_rls = [_RLS(theta0[:4], p0[:4]) for _ in range(len(SPEED_BUCKET_EDGES) - 1)]
+    # Each speed bucket resumes from the seed's gain *at that speed*. Seeding them all
+    # from one point on the schedule would flatten it every ignition, throwing away the
+    # speed dependence the schedule exists to capture.
+    self.speed_rls = []
+    for centre in speed_bucket_centres():
+      inv_k_i = 1.0 / max(seed.lat_accel_factor(centre), 1e-3)
+      self.speed_rls.append(_RLS([inv_k_i, seed.friction, seed.offset, seed.asymmetry],
+                                 [0.5 * inv_k_i ** 2, 0.02, 0.05, 0.05]))
     # lag model: theta = [tau/K], fitted on moving samples with the static terms removed
     self.lag_rls = _RLS([theta0[4]], [p0[4]])
     self.bucket_counts = np.zeros((len(SPEED_BUCKET_EDGES) - 1,
                                    len(LAT_ACCEL_BUCKET_EDGES) - 1), dtype=int)
+
+    # resume the evidence behind those numbers, not just the numbers
+    self.points = 0
+    if learned is not None:
+      self._resume(learned)
 
     # steer ratio: theta = [steer_ratio, steer_ratio * understeer_gradient]
     self.sr_rls = _RLS([self.steer_ratio, self.steer_ratio * 0.002],
@@ -393,7 +433,49 @@ class HondaSteeringLearner:
     # commands are aligned to the motion they caused using the learned dead time, so the
     # transport delay does not leak into the friction and gain estimates
     self._cmd_history = deque(maxlen=int(MAX_DELAY / dt) + 2)
-    self.points = 0
+
+  def _resume(self, learned: HondaSteeringModel) -> None:
+    """Restore the covariance and coverage a cached model was built from.
+
+    Without this a resumed learner holds the right numbers with none of the confidence
+    behind them, so the first minutes of every drive move them as freely as if the car
+    had never been measured, and the model reports itself unconverged until it has
+    re-earned coverage it already has.
+
+    Anything missing or misshapen is skipped rather than trusted: a cache is data, and a
+    learner that resumes from a corrupt one is worse than one that starts over.
+    """
+    try:
+      counts = np.asarray(learned.bucket_counts, dtype=int) if learned.bucket_counts else None
+      if counts is not None and counts.shape == self.bucket_counts.shape:
+        self.bucket_counts = counts
+        self.points = int(learned.points)
+    except (TypeError, ValueError):
+      pass
+
+    cov = learned.covariance if isinstance(learned.covariance, dict) else {}
+    self._restore_covariance(self.steady_rls, cov.get("steady"))
+    self._restore_covariance(self.lag_rls, cov.get("lag"))
+    speed_cov = cov.get("speed")
+    for rls, P in zip(self.speed_rls, speed_cov if isinstance(speed_cov, list) else [], strict=False):
+      self._restore_covariance(rls, P)
+
+  @staticmethod
+  def _restore_covariance(rls: _RLS, stored) -> None:
+    if stored is None:
+      return
+    try:
+      P = np.asarray(stored, dtype=float)
+    except (TypeError, ValueError):
+      return
+    if P.shape != rls.P.shape or not np.isfinite(P).all():
+      return
+    P = P * RESTART_COVARIANCE_INFLATION
+    # a resumed fit must never claim to be less sure than an unlearned one; that would
+    # mean the cache was noise, and the prior is the better starting point
+    if np.any(np.diag(P) > np.diag(rls.P)):
+      return
+    rls.P = P
 
   # -- helpers ------------------------------------------------------------------------
   def _cmd_at(self, delay: float):
@@ -522,9 +604,7 @@ class HondaSteeringLearner:
     # speed schedule: use a bucket's own fit once it has seen enough of the lat accel
     # range, otherwise fall back to the global fit so the schedule stays monotonic-ish
     bps, vs, learned_buckets = [], [], 0
-    for i in range(len(SPEED_BUCKET_EDGES) - 1):
-      lo, hi = SPEED_BUCKET_EDGES[i], SPEED_BUCKET_EDGES[i + 1]
-      centre = lo if i == 0 else (lo + min(hi, 40.0)) / 2.0
+    for i, centre in enumerate(speed_bucket_centres()):
       cells = self.bucket_counts[i]
       if (cells >= MIN_POINTS_PER_BUCKET).sum() >= 2:
         vs.append(self._factor_from(self.speed_rls[i]))
@@ -537,6 +617,13 @@ class HondaSteeringLearner:
     m.learned_buckets = learned_buckets
 
     m.max_useful_torque = self.prior.max_useful_torque
+
+    m.bucket_counts = self.bucket_counts.tolist()
+    m.covariance = {
+      "steady": self.steady_rls.P.tolist(),
+      "speed": [rls.P.tolist() for rls in self.speed_rls],
+      "lag": self.lag_rls.P.tolist(),
+    }
 
     m.valid = self.points >= MIN_TOTAL_POINTS and learned_buckets >= 1
     return m

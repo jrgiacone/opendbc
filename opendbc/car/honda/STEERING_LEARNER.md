@@ -73,6 +73,26 @@ Samples are bucketed by speed × lateral acceleration and the model only reports
 once several cells are populated, so a long highway straight cannot on its own convince
 the learner it knows the car.
 
+## Resuming
+
+A cached model is a starting point *and* the evidence behind it. Passing one as `learned=`
+restores:
+
+* each speed bucket's own gain, at its own speed — seeding every bucket from a single
+  point on the schedule would flatten the speed dependence the schedule exists for,
+* the covariance of every fit, inflated by 2x — resumed confidence, but not full
+  confidence, because tires, alignment, load and temperature all change between
+  ignitions and a learner that resumes at full confidence cannot notice,
+* the bucket coverage and the lifetime point count, so a model that has converged stays
+  converged instead of re-earning coverage it already has,
+* the dead time, which the delay bank holds until its own race has scored enough
+  candidates to mean anything.
+
+The result is a model that compounds across drives rather than restarting each ignition:
+two short trips leave a model built on both. A cache that is missing, misshapen, from
+another car, or from another model version is skipped rather than trusted — the resume is
+lost, the learner is not.
+
 ## Using it
 
 `lat_controller.py` is a PI + learned feedforward lateral controller built on the model.
