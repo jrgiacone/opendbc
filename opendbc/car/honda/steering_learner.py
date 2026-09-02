@@ -58,7 +58,9 @@ MAX_LAT_JERK = 8.0             # m/s^3, reject transients we cannot model
 # keeps both well determined.
 STEADY_JERK = 0.5              # m/s^3, at or below this a sample is a steady state point
 DYNAMIC_JERK = 0.8             # m/s^3, above this a sample carries lag information
-JERK_WINDOW = 10               # samples used to differentiate lateral acceleration
+JERK_WINDOW_S = 0.1            # s over which lateral acceleration is differentiated: long
+                               # enough that the difference is signal rather than noise,
+                               # short enough not to smear the lag it is used to measure
 RACK_MOTION_DEADBAND = 0.5     # deg/s over which the friction sign term ramps
 RACK_RATE_TAU = 0.2            # s, filter on rack speed before taking the friction sign
 MIN_SETTLE_TIME = 0.30         # s of continuously active, unsaturated control before use
@@ -81,7 +83,9 @@ FORGETTING_FACTOR = 0.99995    # ~20 min half life at 100 Hz: tracks tire/temper
 MAX_DELAY = 0.45               # s, Honda Bosch CAN FD racks are the slowest we have seen
 MIN_DELAY = 0.03
 DELAY_CANDIDATES = tuple(np.round(np.arange(MIN_DELAY, MAX_DELAY + 1e-9, 0.03), 3))
-DELAY_BANK_DECIMATION = 5      # only every Nth usable sample updates the bank
+DELAY_BANK_DECIMATION = 10     # only every Nth usable sample updates the bank: the bank
+                               # is by far the most expensive part of the learner, and the
+                               # dead time converges over minutes, not seconds
 DELAY_RESIDUAL_TAU = 2000.0    # samples of residual averaging per candidate
 
 
@@ -383,7 +387,8 @@ class HondaSteeringLearner:
     # lateral acceleration is differentiated over a window, not sample to sample: at
     # 100 Hz a sample-to-sample difference is almost entirely sensor noise, and that
     # noise would attenuate the lag term it feeds
-    self._accel_hist = deque(maxlen=JERK_WINDOW + 1)
+    self._jerk_window = max(1, int(round(JERK_WINDOW_S / dt)))
+    self._accel_hist = deque(maxlen=self._jerk_window + 1)
     self._rate_filt = 0.0
     # commands are aligned to the motion they caused using the learned dead time, so the
     # transport delay does not leak into the friction and gain estimates
@@ -438,7 +443,7 @@ class HondaSteeringLearner:
     self._accel_hist.append(lat_accel)
     lat_jerk = 0.0
     if len(self._accel_hist) == self._accel_hist.maxlen:
-      lat_jerk = (self._accel_hist[-1] - self._accel_hist[0]) / (JERK_WINDOW * self.dt)
+      lat_jerk = (self._accel_hist[-1] - self._accel_hist[0]) / (self._jerk_window * self.dt)
 
     # steer ratio needs an independent yaw measurement; the kinematic fallback is circular
     if (s.yaw_rate is not None or s.lat_accel is not None) and s.v_ego > MIN_LEARN_SPEED:
