@@ -2,7 +2,7 @@
 
 The plant is the inverse of the model the learner fits: a first order lag from commanded
 torque to lateral acceleration, with a transport delay, Coulomb friction, a steady state
-bias, an EPS deadzone and a saturation. Truth values are derived per platform from
+bias and a saturation. Truth values are derived per platform from
 ``CarSpecs`` and the platform's own EPS torque scale, so a sweep over ``values.py::CAR``
 covers the same spread of cars that ``opendbc/car/tests/routes.py`` covers.
 """
@@ -26,7 +26,6 @@ class HondaPlantTruth:
   offset: float
   delay: float
   tau: float
-  deadzone: float
   max_torque: float
   steer_ratio: float
   wheelbase: float
@@ -44,7 +43,6 @@ class HondaPlantTruth:
       offset=float(rng.uniform(-0.05, 0.05)),
       delay=float(rng.uniform(0.04, 0.20)),
       tau=float(rng.uniform(0.08, 0.22)),
-      deadzone=0.0,
       max_torque=float(rng.uniform(0.85, 1.0)),
       steer_ratio=float(CP.steerRatio),
       wheelbase=float(CP.wheelbase),
@@ -67,9 +65,6 @@ class HondaPlant:
     t = self.truth
     self.buf.append(float(np.clip(torque_cmd, -t.max_torque, t.max_torque)))
     u = self.buf[0]
-    if abs(u) < t.deadzone:
-      u = 0.0
-
     # Coulomb friction opposes rack motion, so it is signed by the steering rate:
     # u = a / K + friction * sign(rack rate) + offset
     # Direction comes from a filtered rack speed. Keying Coulomb friction off the raw

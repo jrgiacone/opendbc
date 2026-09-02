@@ -11,8 +11,8 @@ feedforward gain (``lateralTuning.pid.kf = 0.00006`` for every car) and hand pic
     measured gain, so one set of numbers behaves the same on an N-Box and a Pilot,
   * feedback is PI only, as Honda's PID tune is today: the derivative of an error built
     from a noisy lateral acceleration measurement is almost entirely noise,
-  * the command is compensated for the car's measured left/right asymmetry, deadzone and
-    usable torque range,
+  * the command is compensated for the car's measured left/right asymmetry, and clipped
+    to the torque range the rack is measured to actually follow,
   * the integrator freezes on saturation, driver override and learned-model resets.
 
 Learned values are blended in over ``BLEND_TIME`` seconds of valid model, so a car that
@@ -110,7 +110,6 @@ class HondaAdaptiveLatController:
     friction = self._blended("friction")
     offset = self._blended("offset")
     asymmetry = self._blended("asymmetry")
-    deadzone = self._blended("deadzone")
     max_torque = self._blended("max_useful_torque")
 
     if not lat_active:
@@ -122,8 +121,12 @@ class HondaAdaptiveLatController:
       # The asymmetry term mirrors the learned model exactly: a rack that is weaker in one
       # direction needs proportionally more command that way.
       ff = desired_lat_accel / factor + offset + asymmetry * max(desired_lat_accel, 0.0)
-      # the rack is a lagged plant: lead it by its own measured time constant
-      ff += self._blended("response_tau") * desired_lat_jerk / factor
+      # The rack is late by a dead time plus a first order lag, and identification splits
+      # that total between the two only weakly. Leading by the total is both what the
+      # plant needs and what is actually well determined; it is the same compensation
+      # steerActuatorDelay performs today, expressed as a jerk feedforward.
+      lead = self._blended("actuator_delay") + self._blended("response_tau")
+      ff += lead * desired_lat_jerk / factor
       ff += friction * _smooth_sign(desired_lat_jerk if desired_lat_jerk else desired_lat_accel,
                                     FRICTION_WIDTH)
 
@@ -140,10 +143,6 @@ class HondaAdaptiveLatController:
         self.i = float(np.clip(self.i + ki * error * self.dt, -I_LIMIT, I_LIMIT))
 
       output = ff + p + self.i
-
-      # push through the measured deadzone rather than dribbling command into it
-      if deadzone > 0.0 and abs(output) > 1e-3:
-        output = np.sign(output) * (deadzone + abs(output) * (1.0 - deadzone))
 
       clipped = float(np.clip(output, -max_torque, max_torque))
       debug = HondaLatDebug(feedforward=ff, p=p, i=self.i, output=clipped,
