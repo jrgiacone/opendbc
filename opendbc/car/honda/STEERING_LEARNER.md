@@ -33,8 +33,10 @@ alignment bias or worn-in asymmetry. This module measures those instead.
 * **`response_tau` / `actuator_delay`** — the rack's first order time constant and dead
   time. These trade off against each other under smooth steering, so prefer their sum,
   `effective_lag`, wherever you only care about how late the car is.
-* **`deadzone` / `max_useful_torque`** — where the EPS actually starts and stops
-  responding, i.e. how much of `STEER_MAX` is real.
+* **`max_useful_torque`** — how much of `STEER_MAX` the rack will actually follow. This
+  one is *not* learned: it is carried from the prior. A controller that refuses to
+  overdrive the rack never generates the evidence that would show where the rack gives up,
+  and a limit guessed from the little evidence it does produce is worse than no limit.
 * **`steer_ratio` / `understeer_gradient`** — when an independent yaw source is available.
 * **`driver_torque_threshold`** — a learned replacement for `STEER_THRESHOLD`.
 
@@ -117,5 +119,6 @@ which is the fastest way to see which of the tables above are wrong and by how m
 `tests/test_steering_learner.py` builds a plant per platform from that platform's own
 `CarSpecs` (`tests/honda_steer_plant.py`), with truth deliberately displaced from the prior,
 and checks that the learner recovers it — for *every* car in `values.py`, plus that learning
-improves tracking, that nothing is learned while disengaged or overridden, and that the
-command stays bounded whatever the model says.
+pays for itself where the prior is materially wrong and does no harm where it is not, that
+saturated commands do not drag the gain estimate, that nothing is learned while disengaged
+or overridden, and that the command stays bounded whatever the model says.

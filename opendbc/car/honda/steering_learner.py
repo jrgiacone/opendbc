@@ -19,8 +19,10 @@ openpilot steers it and identifies, online and per fingerprint:
   * ``asymmetry``         - left/right gain difference, common on high-mileage racks.
   * ``actuator_delay``/``response_tau`` - the rack's dead time and first order response
     time constant. Their sum, ``effective_lag``, is the better determined of the two.
-  * ``deadzone``/``max_useful_torque`` - where the EPS actually starts and stops
-    responding, i.e. the real usable fraction of ``STEER_MAX``.
+  * ``max_useful_torque`` - the usable fraction of ``STEER_MAX``. This one is carried
+    from the prior rather than learned: a controller that refuses to overdrive the rack
+    never produces the evidence that would show where the rack gives up, and a limit
+    guessed from the little evidence it does produce is worse than no limit at all.
   * ``steer_ratio``/``understeer_gradient`` - when an independent yaw source is present.
   * ``driver_torque_threshold`` - the per-car override threshold currently hardcoded in
     ``values.py::STEER_THRESHOLD``.
@@ -82,10 +84,6 @@ DELAY_CANDIDATES = tuple(np.round(np.arange(MIN_DELAY, MAX_DELAY + 1e-9, 0.03), 
 DELAY_BANK_DECIMATION = 5      # only every Nth usable sample updates the bank
 DELAY_RESIDUAL_TAU = 2000.0    # samples of residual averaging per candidate
 
-# --- response (deadzone / saturation) profiling --------------------------------------
-N_RESPONSE_BINS = 10
-RESPONSE_ACTIVE_FRAC = 0.20    # fraction of peak incremental gain that counts as "responding"
-RESPONSE_REFRESH = 100         # samples between refreshes of the usable torque range
 
 
 def _bucket_index(value: float, edges) -> int:
@@ -141,7 +139,6 @@ class HondaSteeringModel:
 
   response_tau: float = 0.15       # s, first order rack/EPS response time constant
   actuator_delay: float = 0.1
-  deadzone: float = 0.0
   max_useful_torque: float = 1.0
 
   steer_ratio: float = 0.0          # 0 when not learned
@@ -224,7 +221,6 @@ def prior_from_car_params(CP) -> HondaSteeringModel:
     asymmetry=0.0,
     response_tau=0.15,
     actuator_delay=float(np.clip(delay, MIN_DELAY, MAX_DELAY)),
-    deadzone=0.0,
     max_useful_torque=1.0,
     steer_ratio=float(CP.steerRatio),
     understeer_gradient=0.0,
@@ -316,42 +312,6 @@ class _DelayBank:
     return self.rls[self.best]
 
 
-class _ResponseProfiler:
-  """Bins incremental EPS response by |command| to find the deadzone and saturation."""
-
-  def __init__(self):
-    self.num = np.zeros(N_RESPONSE_BINS)
-    self.den = np.zeros(N_RESPONSE_BINS)
-    self.edges = np.linspace(0.0, 1.0, N_RESPONSE_BINS + 1)
-
-  def update(self, torque_cmd: float, d_cmd: float, d_rate: float) -> None:
-    if abs(d_cmd) < 1e-4:
-      return
-    i = min(int(abs(torque_cmd) * N_RESPONSE_BINS), N_RESPONSE_BINS - 1)
-    # sign-matched incremental gain: how much rate change one unit of command change
-    # buys. Motion against the command counts negative, so a dead or saturated bin
-    # cannot look responsive just because the wheel was moving.
-    signed = abs(d_rate) if np.sign(d_cmd) == np.sign(d_rate) else -abs(d_rate)
-    self.num[i] += signed
-    self.den[i] += abs(d_cmd)
-
-  def solve(self) -> tuple[float, float] | None:
-    seen = self.den > 0.02
-    if seen.sum() < 3:
-      return None
-    gain = np.zeros(N_RESPONSE_BINS)
-    gain[seen] = self.num[seen] / self.den[seen]
-    peak = gain.max()
-    if peak <= 0.0:
-      return None
-    responding = np.where(seen & (gain > RESPONSE_ACTIVE_FRAC * peak))[0]
-    if not len(responding):
-      return None
-    deadzone = float(self.edges[responding[0]])
-    max_useful = float(self.edges[responding[-1] + 1])
-    return deadzone, max_useful
-
-
 class _OverrideThresholdEstimator:
   """Learns the driver torque noise floor, i.e. ``values.py::STEER_THRESHOLD`` per car."""
 
@@ -416,7 +376,6 @@ class HondaSteeringLearner:
     self.sr_rls = _RLS([self.steer_ratio, self.steer_ratio * 0.002],
                        [4.0, 0.01])
 
-    self.response = _ResponseProfiler()
     self.override_est = _OverrideThresholdEstimator(seed.driver_torque_threshold)
 
     self._active_for = 0.0
@@ -429,8 +388,6 @@ class HondaSteeringLearner:
     # commands are aligned to the motion they caused using the learned dead time, so the
     # transport delay does not leak into the friction and gain estimates
     self._cmd_history = deque(maxlen=int(MAX_DELAY / dt) + 2)
-    self._max_useful_cache = self.prior.max_useful_torque
-    self._response_age = 0
     self.points = 0
 
   # -- helpers ------------------------------------------------------------------------
@@ -476,9 +433,6 @@ class HondaSteeringLearner:
 
     self._rate_filt += (s.steering_rate_deg - self._rate_filt) * self.dt / RACK_RATE_TAU
     self._cmd_history.append(s.torque_cmd)
-    if last is not None:
-      self.response.update(s.torque_cmd, s.torque_cmd - last.torque_cmd,
-                           s.steering_rate_deg - last.steering_rate_deg)
 
     lat_accel = self._lat_accel(s)
     self._accel_hist.append(lat_accel)
@@ -503,9 +457,7 @@ class HondaSteeringLearner:
     if abs(lat_jerk) > MAX_LAT_JERK:
       return
     torque_cmd = self._cmd_at(self.delay_bank.delay)
-    # a command the rack could not actually follow tells us nothing about the plant: the
-    # motion it produced belongs to a smaller command than the one we recorded
-    if torque_cmd is None or abs(torque_cmd) >= self._max_useful() - 1e-3:
+    if torque_cmd is None:
       return
 
     i_speed = _bucket_index(s.v_ego, SPEED_BUCKET_EDGES)
@@ -520,6 +472,12 @@ class HondaSteeringLearner:
     # steering never reaches full sign, too narrow and the remaining noise dithers it.
     sign = _smooth_sign(self._rate_filt, RACK_MOTION_DEADBAND)
     x = np.array([lat_accel, sign, 1.0, max(lat_accel, 0.0), lat_jerk])
+
+    # a command the rack could not actually follow tells us nothing about the plant: the
+    # motion it produced belongs to a smaller command than the one we recorded
+    if abs(torque_cmd) >= self.prior.max_useful_torque - 1e-3:
+      return
+
     self.delay_bank.update(x, self._cmd_at)
 
     if abs(lat_jerk) <= STEADY_JERK:
@@ -533,15 +491,6 @@ class HondaSteeringLearner:
       # the lag term to explain is the part of the command that leads the motion
       residual = torque_cmd - float(x[:4] @ self.steady_rls.theta)
       self.lag_rls.update(np.array([lat_jerk]), residual)
-
-  def _max_useful(self) -> float:
-    """Largest command worth learning from, refreshed occasionally rather than per sample."""
-    if self._response_age <= 0:
-      profile = self.response.solve()
-      self._max_useful_cache = profile[1] if profile is not None else self.prior.max_useful_torque
-      self._response_age = RESPONSE_REFRESH
-    self._response_age -= 1
-    return self._max_useful_cache
 
   # -- output -------------------------------------------------------------------------
   def _factor_from(self, rls: _RLS) -> float:
@@ -582,11 +531,7 @@ class HondaSteeringLearner:
     m.lat_accel_factor_v = vs
     m.learned_buckets = learned_buckets
 
-    profile = self.response.solve()
-    if profile is not None:
-      m.deadzone, m.max_useful_torque = profile
-    else:
-      m.deadzone, m.max_useful_torque = self.prior.deadzone, self.prior.max_useful_torque
+    m.max_useful_torque = self.prior.max_useful_torque
 
     m.valid = self.points >= MIN_TOTAL_POINTS and learned_buckets >= 1
     return m
