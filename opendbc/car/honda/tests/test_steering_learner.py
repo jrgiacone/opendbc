@@ -16,24 +16,30 @@ from opendbc.car.honda.steering_learner import (
 from opendbc.car.honda.tests.honda_steer_plant import HondaPlant, HondaPlantTruth
 from opendbc.car.honda.values import CAR
 
-DT = 0.01
+# The learner is parameterised by its step time; the fleet sweep runs at 50 Hz, which
+# halves what is a very long test and exercises that dt independence. test_learns_at_100hz
+# covers the rate Honda control actually runs at.
+DT = 0.02
 ALL_CARS = list(CAR)
 
 
-def drive(CP, truth, seconds=350.0, learned=None, v_profile=None, amplitude_scale=1.0):
+def drive(CP, truth, seconds=250.0, learned=None, v_profile=None, amplitude_scale=1.0, dt=None):
   """Run the adaptive controller against the plant and return (controller, plant)."""
-  plant = HondaPlant(truth, DT)
-  ctrl = HondaAdaptiveLatController(CP, dt=DT, learned=learned)
-  n = int(seconds / DT)
+  dt = DT if dt is None else dt
+  plant = HondaPlant(truth, dt)
+  ctrl = HondaAdaptiveLatController(CP, dt=dt, learned=learned)
+  n = int(seconds / dt)
   rng = np.random.default_rng(0)
 
   for i in range(n):
-    t = i * DT
+    t = i * dt
     # a mix of speeds and curvatures: highway sweepers, suburban curves, and lane changes
     v = v_profile(t) if v_profile else 12.0 + 12.0 * (0.5 + 0.5 * math.sin(2 * math.pi * t / 240.0))
-    # keep the demand inside what the rack can actually deliver: a saturated command
-    # teaches nothing, which is true on the road as well as here
-    amp = amplitude_scale * float(np.clip(0.45 * truth.lat_accel_factor, 0.4, 2.2))
+    # Scale the demand to the car's authority so the command stays mostly inside what the
+    # rack can deliver - a saturated command teaches nothing, on the road as here - but
+    # never below what ordinary driving asks for: a real Odyssey takes the same curves as
+    # a real Civic, and too gentle a demand starves the lag fit of anything to measure.
+    amp = amplitude_scale * float(np.clip(0.45 * truth.lat_accel_factor, 0.8, 2.2))
     desired = amp * (0.55 * math.sin(2 * math.pi * t / 17.0)
                      + 0.32 * math.sin(2 * math.pi * t / 6.3 + 1.0)
                      + 0.13 * math.sin(2 * math.pi * t / 2.1))
@@ -145,6 +151,17 @@ def test_learns_command_to_motion_lag(car):
   assert abs(m.effective_lag - (truth.delay + truth.tau)) < 0.10, \
     f"{car}: learned lag {m.effective_lag:.3f} vs truth {truth.delay + truth.tau:.3f}"
   assert MIN_DELAY <= m.actuator_delay <= MAX_DELAY
+
+
+def test_learns_at_100hz():
+  """The rate Honda control actually runs at, on a car whose prior is well off."""
+  CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+  truth = HondaPlantTruth.for_car(CP)
+  ctrl, _ = drive(CP, truth, seconds=250.0, dt=0.01)
+  m = ctrl.learner.model()
+  assert m.valid
+  assert m.lat_accel_factor(20.0) == pytest.approx(truth.lat_accel_factor, rel=0.20)
+  assert abs(m.effective_lag - (truth.delay + truth.tau)) < 0.10
 
 
 def test_learns_speed_schedule():

@@ -34,8 +34,14 @@ class HondaPlantTruth:
   def for_car(CP, seed: int = 0) -> "HondaPlantTruth":
     """Plausible-but-not-prior truth for one platform, deterministic in ``seed``."""
     rng = np.random.default_rng(zlib.crc32(f"{CP.carFingerprint}:{seed}".encode()))
+    # Same shape as the prior, so the truth stays a plausible Honda rack; what makes this
+    # a test of learning is the displacement from the prior below, not a different formula.
+    # (Scaling authority with the square root of the CAN count scale, as an earlier version
+    # did, made small-count platforms like the CR-V EU absurdly weak: 0.7 m/s^2 at full
+    # command, which no Honda rack is.)
     steer_max = float(CP.lateralParams.torqueBP[-1]) or 4096.0
-    base = 2.5 * (1500.0 / float(CP.mass)) * math.sqrt(steer_max / 4096.0)
+    nudge = float(np.clip((max(steer_max, 1.0) / 4096.0) ** 0.15, 0.8, 1.25))
+    base = 2.5 * (1500.0 / float(CP.mass)) * nudge
     return HondaPlantTruth(
       # the point of learning: truth is up to 40% away from what the prior guesses
       lat_accel_factor=float(np.clip(base * rng.uniform(0.6, 1.4), 0.5, 7.0)),
