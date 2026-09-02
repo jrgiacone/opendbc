@@ -96,9 +96,20 @@ stored_model = ctrl.learner.model()                             # persist betwee
 The learner can also be driven on its own (`HondaSteeringLearner.update(HondaSteerSample(...))`)
 next to the existing controller, to collect models without changing what the car does.
 
-This is deliberately *not* wired into the shipping Honda control path: it is a controller
-and an identification tool, and swapping the lateral controller for the whole Honda fleet
-is a change that should be made on measured routes, not on a merge.
+The controller is deliberately *not* wired into the shipping Honda control path: swapping
+the lateral controller for the whole Honda fleet is a change to make on measured routes,
+not on a merge.
+
+The *learner* is wired in, observe-only. openpilot's `hondasteerd` runs it alongside
+whatever is actually steering, publishes `hondaSteeringParameters` at 4 Hz, and caches the
+model in `Params` across ignition cycles (keyed by fingerprint and model version, so a
+different car or a changed model starts over rather than inheriting someone else's
+numbers). It costs about 76 us per update at 50 Hz, under half a percent of a core.
+Nothing in the control path reads any of it.
+
+Read it back with openpilot's `tools/car_porting/show_honda_steering.py` — from the
+device, from a route's logs, or as a per-publish history of how it converged across a
+drive.
 
 ## Offline, over the fleet
 
