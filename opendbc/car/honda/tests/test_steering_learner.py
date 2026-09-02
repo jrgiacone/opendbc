@@ -244,6 +244,101 @@ def test_output_always_bounded(car):
   assert abs(ctrl.i) <= 0.36
 
 
+class TestResume:
+  """A restart must continue a model, not merely copy its numbers."""
+
+  @staticmethod
+  def trained(car=CAR.HONDA_CIVIC_2022):
+    CP = CarInterface.get_non_essential_params(car)
+    truth = HondaPlantTruth.for_car(CP)
+    ctrl, _ = drive(CP, truth)
+    model = ctrl.learner.model()
+    assert model.valid
+    return CP, truth, model
+
+  def test_keeps_the_speed_schedule(self):
+    """Seeding every bucket from one point on the schedule would flatten it each ignition."""
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_BOSCH)
+    learner = HondaSteeringLearner(CP, dt=DT)
+    rng = np.random.default_rng(1)
+    for i in range(int(1200.0 / DT)):
+      t = i * DT
+      v = 10.0 + 20.0 * ((i * DT) % 300.0) / 300.0
+      k = 2.5 * (1.0 - 0.015 * (v - 10.0))
+      a = 1.5 * math.sin(2 * math.pi * t / 8.0) + 0.4 * rng.normal()
+      learner.update(HondaSteerSample(t=t, v_ego=v, torque_cmd=a / k, steering_angle_deg=0.0,
+                                      steering_rate_deg=math.degrees(a), lat_active=True,
+                                      lat_accel=a))
+    before = learner.model()
+    assert before.learned_buckets >= 2
+    spread = max(before.lat_accel_factor_v) - min(before.lat_accel_factor_v)
+    assert spread > 0.1, before.lat_accel_factor_v
+
+    after = HondaSteeringLearner(CP, dt=DT, learned=before).model()
+    assert after.lat_accel_factor_v == pytest.approx(before.lat_accel_factor_v, rel=0.02)
+    assert after.learned_buckets == before.learned_buckets
+
+  def test_keeps_confidence(self):
+    """Resumed, but not at full confidence: the car can change between ignitions."""
+    CP, _, model = self.trained()
+    resumed = HondaSteeringLearner(CP, dt=DT, learned=model)
+    fresh = HondaSteeringLearner(CP, dt=DT)
+
+    trained_var = model.covariance["steady"][0][0]
+    assert resumed.steady_rls.P[0][0] == pytest.approx(trained_var * 2.0)
+    assert resumed.steady_rls.P[0][0] < fresh.steady_rls.P[0][0]
+
+  def test_keeps_lifetime_points_and_stays_converged(self):
+    CP, _, model = self.trained()
+    resumed = HondaSteeringLearner(CP, dt=DT, learned=model).model()
+    assert resumed.points == model.points
+    assert resumed.valid, "a resumed model must not report itself unconverged"
+
+  def test_accumulates_across_drives(self):
+    """Two short drives must leave a model built on both, not on the second alone."""
+    CP, truth, first = self.trained()
+    ctrl = HondaAdaptiveLatController(CP, dt=DT, learned=first)
+    plant = HondaPlant(truth, DT)
+    for i in range(int(120.0 / DT)):
+      t = i * DT
+      desired = 1.2 * math.sin(2 * math.pi * t / 11.0)
+      jerk = 1.2 * 2 * math.pi / 11.0 * math.cos(2 * math.pi * t / 11.0)
+      torque, _ = ctrl.update(desired, plant.lat_accel, 24.0, plant.angle_deg, plant.rate_deg,
+                              lat_active=True, desired_lat_jerk=jerk)
+      plant.step(torque, 24.0)
+    second = ctrl.learner.model()
+    assert second.points > first.points
+    assert second.lat_accel_factor(20.0) == pytest.approx(truth.lat_accel_factor, rel=0.20)
+
+  def test_resumes_the_delay_rather_than_re_racing_it(self):
+    CP, _, model = self.trained()
+    resumed = HondaSteeringLearner(CP, dt=DT, learned=model)
+    assert resumed.model().actuator_delay == pytest.approx(model.actuator_delay)
+
+  @pytest.mark.parametrize("damage", [
+    {"bucket_counts": [[1, 2], [3, 4]]},
+    {"bucket_counts": "not a list"},
+    {"covariance": {"steady": [[1.0]]}},
+    {"covariance": {"steady": "nope"}},
+    {"covariance": {"steady": [[float("nan")] * 4] * 4}},
+    {"bucket_counts": [], "covariance": {}},
+  ])
+  def test_ignores_a_misshapen_cache(self, damage):
+    """A corrupt cache must cost us the resume, not the learner."""
+    CP, _, model = self.trained()
+    for k, v in damage.items():
+      setattr(model, k, v)
+    learner = HondaSteeringLearner(CP, dt=DT, learned=model)
+    if "covariance" in damage:
+      # nothing restored: the fit is as open as an unlearned one seeded with these values
+      unrestored = 0.5 * (1.0 / model.lat_accel_factor(20.0)) ** 2
+      assert learner.steady_rls.P[0][0] == pytest.approx(unrestored)
+    # whatever was wrong, the gain still resumes and the learner still runs
+    assert learner.steady_rls.theta[0] == pytest.approx(1.0 / model.lat_accel_factor(20.0))
+    learner.update(HondaSteerSample(t=0.0, v_ego=25.0, torque_cmd=0.3, steering_angle_deg=2.0,
+                                    steering_rate_deg=1.0, lat_active=True, lat_accel=0.8))
+
+
 def test_model_round_trips():
   CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
   m = prior_from_car_params(CP)
