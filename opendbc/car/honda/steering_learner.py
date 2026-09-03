@@ -133,6 +133,17 @@ P_MAX_SCALE = 4.0
 # the delay bank re-races from scratch each drive; until it has run enough candidates to
 # mean anything, report the delay we resumed with rather than a half finished race
 DELAY_MIN_UPDATES = 200
+# How much better than the prior's own candidate the winner has to be before it is
+# believed. Fitting (dead time, tau) by output error over route 729a2e65b1f6201d - the
+# method that recovers both exactly on a synthetic rack of known truth, at this route's
+# noise and excitation - leaves a residual surface with 0.6% total leverage on dead time
+# and 0.2% on tau, sliding monotonically into the corner of the grid rather than settling
+# anywhere. Against 578% and 224% on the synthetic, that is around a thousand times less
+# structure than identification needs, and an argmin over it is a coin toss. Note this
+# gates only what is *published*: the bank keeps racing, and the fit keeps its freedom to
+# trade dead time against tau, which is what lands their sum in the right place even when
+# the split between them is arbitrary.
+DELAY_MIN_IMPROVEMENT = 0.05
 
 # --- delay estimation ----------------------------------------------------------------
 # The dead time is identified by fitting the same model at a bank of candidate delays and
@@ -235,6 +246,14 @@ class HondaSteeringModel:
   # the compensation was trusted on, and how well the command tracks the fitted target
   # with it applied against the uncompensated one. Published so the fleet can settle
   # whether subtracting the roll estimate helps this signal or hurts it.
+  # Whether the dead time is a measurement or the prior it started from, and whether the
+  # winning candidate sat on an end of the bank's grid. A delay that never cleared
+  # DELAY_MIN_IMPROVEMENT is the prior wearing a learned model's clothes, which is the
+  # failure this learner exists to stop making. ``effective_lag`` is unaffected either
+  # way: it is the sum, and the sum is what the data determines.
+  delay_learned: bool = False
+  delay_railed: bool = False
+
   roll_comp_fraction: float = 0.0
   lat_accel_torque_corr: float = 0.0
   lat_accel_torque_corr_raw: float = 0.0
@@ -251,9 +270,11 @@ class HondaSteeringModel:
 
     Dead time and the first order response time constant trade off against each other in
     identification (a slower rack looks like a later one over a few seconds of smooth
-    steering), so their sum is far better determined than either alone. Use this when you
-    care about how late the car is, and ``actuator_delay`` only where a pure dead time is
-    required.
+    steering), so their sum is far better determined than either alone. On real lane
+    keeping the split is not merely worse determined but unobservable - 0.2% residual
+    leverage on tau across its whole range on route 729a2e65b1f6201d - so this sum is the
+    only lag figure to trust. Use ``actuator_delay`` alone where a pure dead time is
+    required, and check ``delay_learned`` before reading it as a measurement.
     """
     return self.actuator_delay + self.response_tau
 
@@ -396,8 +417,14 @@ class _DelayBank:
     self.rls = [_RLS(theta0, p0) for _ in self.candidates]
     self.residual = np.full(len(self.candidates), np.nan)
     self.n = 0
-    self.best = int(np.argmin(np.abs(np.array(self.candidates) - prior_delay)))
+    self.prior_index = int(np.argmin(np.abs(np.array(self.candidates) - prior_delay)))
+    self.best = self.prior_index
     self.delay = float(np.clip(prior_delay, MIN_DELAY, MAX_DELAY))
+    self.prior_delay = self.delay
+    # the winner sat on an end of the grid: an argmin that ran out of candidates is a
+    # statement about the grid, not about the rack, and is published as such
+    self.railed = False
+    self.learned = False
 
   def update(self, build_x, y: float) -> None:
     """``build_x(delay)`` returns the regressor using the command issued ``delay`` ago."""
@@ -418,7 +445,19 @@ class _DelayBank:
     # seconds, and on a fresh one it would swing the estimate around early in a drive.
     if np.isnan(self.residual).all() or self.n < DELAY_MIN_UPDATES:
       return
-    self.best = int(np.nanargmin(self.residual))
+    best = int(np.nanargmin(self.residual))
+    # A flat surface makes the argmin a coin toss between candidates that explain the data
+    # equally well, and following it publishes noise as a measurement.
+    reference = self.residual[self.prior_index]
+    improvement = 0.0 if not np.isfinite(reference) or reference <= 0.0 else \
+        1.0 - self.residual[best] / reference
+    if improvement < DELAY_MIN_IMPROVEMENT:
+      self.best = self.prior_index; self.delay = self.prior_delay
+      self.railed = False; self.learned = False
+      return
+    self.best = best
+    self.railed = best in (0, len(self.candidates) - 1)
+    self.learned = True
     self.delay = self._interpolated()
 
   def _interpolated(self) -> float:
@@ -837,6 +876,8 @@ class HondaSteeringLearner:
       asymmetry=float(np.clip(-self.steady_rls.theta[3] / scale, -0.5, 0.5)),
       response_tau=float(np.clip(-self.lag_rls.theta[0], 0.0, 0.6)),
       actuator_delay=self.delay_bank.delay,
+      delay_learned=self.delay_bank.learned,
+      delay_railed=self.delay_bank.railed,
       steer_ratio=self.steer_ratio,
       understeer_gradient=self.understeer_gradient,
       driver_torque_threshold=self.override_est.threshold,

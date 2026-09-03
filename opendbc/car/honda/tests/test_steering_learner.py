@@ -534,3 +534,41 @@ class TestRollCompensationGate:
     # at least as well as leaving it in
     assert m.lat_accel_torque_corr > 0.5
     assert m.lat_accel_torque_corr >= m.lat_accel_torque_corr_raw
+
+
+class TestLagIsNotOverclaimed:
+  """The dead time is published as a measurement only when it beat the prior.
+
+  Fitting (dead time, tau) by output error over route 729a2e65b1f6201d leaves 0.2%
+  residual leverage on tau and 0.6% on the dead time, against 224% and 578% on a
+  synthetic rack of known truth at the same noise and excitation. On a surface that flat
+  the argmin is a coin toss, so the bank holds the prior unless some candidate is
+  meaningfully better than the prior's own. The fit itself is untouched: tau stays free
+  to trade against the dead time, which is what lands their sum in the right place.
+  """
+
+  def test_a_flat_race_keeps_the_prior(self):
+    """No command at all: every candidate explains the data identically."""
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+    learner = HondaSteeringLearner(CP, dt=DT)
+    prior_delay = learner.delay_bank.delay
+    for i in range(20000):
+      learner.update(HondaSteerSample(
+        t=i * DT, v_ego=20.0, torque_cmd=0.0, steering_angle_deg=0.0,
+        steering_rate_deg=0.0, lat_active=True, lat_accel=0.0, lat_accel_valid=True))
+    m = learner.model()
+    assert m.actuator_delay == pytest.approx(prior_delay)
+    assert not m.delay_learned, "an unwon race must not be published as a measurement"
+    assert not m.delay_railed
+
+  def test_a_real_lag_still_clears_the_bar(self):
+    """The gate must not block a lag the data genuinely supports.
+
+    This is the case that says the gate is a publication rule and not a lobotomy: on a
+    plant with a real dead time and a real time constant, the learned sum still lands.
+    """
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+    truth = HondaPlantTruth.for_car(CP)
+    ctrl, _ = drive(CP, truth)
+    m = ctrl.learner.model()
+    assert abs(m.effective_lag - (truth.delay + truth.tau)) < 0.10
