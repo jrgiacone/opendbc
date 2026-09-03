@@ -46,14 +46,24 @@ The steady state model is the one openpilot's torque control already uses, made 
 and speed scheduled:
 
 ```
-u = a_lat / K(v) + friction * sign(rack rate) + offset + asymmetry * max(a_lat, 0)
+a_lat = K(v) * u  -  K*offset  -  K*friction * sign(rack rate)  -  K*asym * max(u, 0)
 ```
 
 fitted by recursive least squares with a forgetting factor, seeded from a per-platform
 prior derived from the car's own `CarParams` (`prior_from_car_params`), so an unlearned
 car behaves exactly as it does today.
 
-Three details make it work on the gentle steering openpilot actually does:
+**The orientation matters more than anything else here.** The command is the regressor and
+the measured lateral acceleration is the dependent variable, matching `torqued`. Written
+the other way round — solving for `u` with `a_lat` among the regressors, which this
+learner did until route `729a2e65b1f6201d` — puts the noisiest signal in the system on the
+regressor side, where its own noise biases its coefficient toward zero. That coefficient
+was `1/K`, so the published gain, its reciprocal, ran away *upward*: on that route it
+drifted 3.2 → 4.0 → 4.4, hit the 8.0 rail, and finally crossed into negative `1/K`. In
+simulation with a 0.8 m/s² measurement error and a stale yaw rate, the old form published
+8.0 against a truth of 2.4 while the current form publishes 2.18.
+
+Three further details make it work on the gentle steering openpilot actually does:
 
 1. **Delay is identified by model fit, not correlation.** A bank of copies of the model is
    fitted at candidate dead times, and the candidate that explains the command best wins;
@@ -70,8 +80,27 @@ Three details make it work on the gentle steering openpilot actually does:
    at 100 Hz a raw difference is nearly all noise.
 
 Samples are bucketed by speed × lateral acceleration and the model only reports `valid`
-once several cells are populated, so a long highway straight cannot on its own convince
-the learner it knows the car.
+once several cells are populated **and they span at least 1.3 m/s²**. Point count is not
+coverage: the failing route had 1150 points in one cell and 100 in its neighbour, which
+passes any count test and still describes a band too narrow to separate gain from offset.
+
+Three things are refused rather than guessed:
+
+* **Asymmetry** stays switched off until the command has been driven both ways. While the
+  command is one-signed, `max(u, 0)` is either identical to `u` or identically zero, and
+  the pair is unidentifiable — so it is not fitted at all rather than fitted arbitrarily.
+* **A diverged fit** — a gain outside 0.2 to 8.0 — is reported as `diverged` and reset to
+  the prior, not silently replaced by it. Substituting the prior quietly, which this did
+  originally, makes a broken fit and an unfitted one identical in the published model, and
+  that is what kept the divergence invisible for a whole route.
+* **A stale measurement** is not fitted. `deviceMotion` ran at 7 Hz on the first segment of
+  that route against a nominal 20 Hz, and a held yaw rate is simply a wrong lateral
+  acceleration. Samples older than 0.1 s still advance the command history — dropping them
+  would break the delay alignment, which counts samples — but nothing is fitted to them.
+
+No direction of the covariance may wind up beyond four times its prior width, so a
+direction the data never excites cannot grow until the first sample touching it lands with
+enormous gain.
 
 ## Resuming
 

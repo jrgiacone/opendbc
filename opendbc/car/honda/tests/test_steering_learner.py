@@ -8,6 +8,7 @@ from opendbc.car.honda.lat_controller import HondaAdaptiveLatController
 from opendbc.car.honda.steering_learner import (
   MAX_DELAY,
   MIN_DELAY,
+  MIN_TOTAL_POINTS,
   HondaSteeringLearner,
   HondaSteeringModel,
   HondaSteerSample,
@@ -331,12 +332,123 @@ class TestResume:
     learner = HondaSteeringLearner(CP, dt=DT, learned=model)
     if "covariance" in damage:
       # nothing restored: the fit is as open as an unlearned one seeded with these values
-      unrestored = 0.5 * (1.0 / model.lat_accel_factor(20.0)) ** 2
+      unrestored = 0.5 * model.lat_accel_factor(20.0) ** 2
       assert learner.steady_rls.P[0][0] == pytest.approx(unrestored)
     # whatever was wrong, the gain still resumes and the learner still runs
-    assert learner.steady_rls.theta[0] == pytest.approx(1.0 / model.lat_accel_factor(20.0))
+    assert learner.steady_rls.theta[0] == pytest.approx(model.lat_accel_factor(20.0))
     learner.update(HondaSteerSample(t=0.0, v_ego=25.0, torque_cmd=0.3, steering_angle_deg=2.0,
                                     steering_rate_deg=1.0, lat_active=True, lat_accel=0.8))
+
+
+class TestNoisyMeasurement:
+  """Regression tests for route 729a2e65b1f6201d, where the published gain railed at 8.0.
+
+  The fit is oriented with the command as the regressor and the measured lateral
+  acceleration as the dependent variable. Oriented the other way, noise on the
+  measurement biased its own coefficient (1/K) toward zero and the published gain, being
+  its reciprocal, ran away upward.
+  """
+
+  @staticmethod
+  def feed(noise=0.0, hold_hz=None, one_signed=True, seconds=185.0, seed=0, truth_k=2.4,
+           flip=True):
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+    learner = HondaSteeringLearner(CP, dt=DT)
+    friction, offset, tau = 0.05, 0.02, 0.15
+    rng = np.random.default_rng(seed)
+    t, held, last_hold = 0.0, 0.0, -1e9
+    while t < seconds:
+      t += DT
+      centre = (-0.55 if (t < seconds * 0.8 or not flip) else 0.55) if one_signed else 0.0
+      amp = 0.08 if one_signed else 1.6
+      a = centre + amp * math.sin(2 * math.pi * t / 9.0)
+      a_dot = amp * 2 * math.pi / 9.0 * math.cos(2 * math.pi * t / 9.0)
+      u = a / truth_k + tau * a_dot / truth_k + offset + friction * np.sign(a_dot)
+      measured = a + rng.normal(0.0, noise)
+      if hold_hz is not None:            # yaw rate held between slow deviceMotion updates
+        if t - last_hold >= 1.0 / hold_hz:
+          held, last_hold = measured, t
+        measured = held
+      learner.update(HondaSteerSample(t=t, v_ego=22.0, torque_cmd=u, steering_angle_deg=a * 3,
+                                      steering_rate_deg=math.degrees(a_dot) * 5,
+                                      lat_active=True, lat_accel=measured))
+    return learner
+
+  @pytest.mark.parametrize("noise,hold_hz", [(0.0, None), (0.3, None), (0.5, 7), (0.8, 7)])
+  def test_noise_does_not_inflate_the_gain(self, noise, hold_hz):
+    """The exact conditions of the route: a narrow one-signed band and a stale yaw rate."""
+    m = self.feed(noise=noise, hold_hz=hold_hz).model()
+    assert not m.diverged
+    assert m.lat_accel_factor(22.0) == pytest.approx(2.4, rel=0.15), \
+      f"noise={noise} hold={hold_hz}: gain {m.lat_accel_factor(22.0):.2f}"
+
+  def test_a_diverged_fit_is_surfaced_not_masked(self):
+    """A diverged fit must not be indistinguishable from an unfitted one."""
+    learner = self.feed(noise=0.0, one_signed=False)
+    assert learner.model().valid
+    # force every fit outside the physically possible range
+    for rls in [learner.steady_rls] + learner.speed_rls:
+      rls.theta[0] = -0.5
+    m = learner.model()
+    assert m.diverged
+    assert not m.valid, "a diverged fit must never be published as converged"
+    # with nothing measured, the published gain is the prior - but flagged, not silent
+    assert m.lat_accel_factor(22.0) == pytest.approx(learner.prior.lat_accel_factor(22.0))
+
+  def test_divergence_resets_rather_than_persisting(self):
+    learner = self.feed(noise=0.0, one_signed=False)
+    before = learner.resets
+    learner.steady_rls.theta[0] = -0.5
+    learner._check_divergence()
+    assert learner.resets == before + 1
+    assert learner.steady_rls.theta[0] == pytest.approx(learner.prior.lat_accel_factor(20.0))
+
+  def test_asymmetry_waits_for_both_directions(self):
+    """max(u, 0) duplicates the command column while the command is one-signed."""
+    one_way = self.feed(one_signed=True, seconds=120.0, flip=False)
+    assert not one_way._asym_enabled
+    assert one_way.model().asymmetry == 0.0
+    assert not one_way.model().asymmetry_learned
+
+    both = self.feed(one_signed=False)
+    assert both._asym_enabled and both.model().asymmetry_learned
+
+  def test_a_narrow_band_is_not_treated_as_coverage(self):
+    """Point count is not coverage: 1000 points in one cell still fit nothing."""
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+    learner = HondaSteeringLearner(CP, dt=DT)
+    for i in range(20000):
+      t = i * DT
+      a = -0.55 + 0.02 * math.sin(2 * math.pi * t / 9.0)   # one cell, forever
+      learner.update(HondaSteerSample(t=t, v_ego=22.0, torque_cmd=a / 2.4 + 0.02,
+                                      steering_angle_deg=a * 3, steering_rate_deg=0.5,
+                                      lat_active=True, lat_accel=a))
+    m = learner.model()
+    assert m.points > MIN_TOTAL_POINTS, "the point count alone would have passed"
+    assert not m.valid, "a single narrow band must not count as a converged model"
+
+  def test_a_stale_measurement_is_not_fitted(self):
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+    learner = HondaSteeringLearner(CP, dt=DT)
+    for i in range(5000):
+      t = i * DT
+      a = 1.2 * math.sin(2 * math.pi * t / 9.0)
+      learner.update(HondaSteerSample(t=t, v_ego=22.0, torque_cmd=a / 2.4, steering_angle_deg=a * 3,
+                                      steering_rate_deg=5.0, lat_active=True, lat_accel=a,
+                                      lat_accel_valid=False))
+    assert learner.points == 0
+
+
+class TestCovarianceWindup:
+  def test_no_direction_winds_up_without_data(self):
+    """An unexcited direction must not grow until the first sample that touches it lands
+    with enormous gain."""
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+    learner = HondaSteeringLearner(CP, dt=DT)
+    rls = learner.steady_rls
+    for _ in range(50000):
+      rls.update(np.array([1.0, 1.0, 0.0, 0.0]), 2.4)     # nothing excites columns 2, 3
+    assert np.all(np.diag(rls.P) <= rls.p_max + 1e-9)
 
 
 def test_model_round_trips():

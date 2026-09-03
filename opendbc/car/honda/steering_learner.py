@@ -81,6 +81,26 @@ FORGETTING_FACTOR = 0.99995    # ~20 min half life at 100 Hz: tracks tire/temper
 # and a learner that resumes at full confidence cannot notice. Inflating the covariance
 # re-opens it just enough to move if the car has.
 RESTART_COVARIANCE_INFLATION = 2.0
+
+# A gain outside this range is not a measurement, it is a diverged fit. Surfacing that is
+# the point: quietly substituting the prior makes a broken fit indistinguishable from an
+# unfitted one, which is exactly what hid the divergence on route 729a2e65b1f6201d.
+K_MIN_VALID = 0.2
+K_MAX_VALID = 8.0
+
+# Asymmetry needs command in both directions to mean anything: with one-signed command,
+# max(u, 0) is either identical to u or identically zero, and the pair is unidentifiable.
+ASYM_MIN_CMD = 0.05
+ASYM_MIN_SAMPLES = 200
+
+# A fit over a narrow band of lateral acceleration is a fit to noise, whatever its point
+# count: the signal has to span enough range to outweigh the error on it.
+MIN_LAT_ACCEL_SPAN = 1.3
+
+# No direction of the covariance may wind up beyond this multiple of its prior width. An
+# unexcited direction otherwise grows until the first sample that touches it lands with
+# enormous gain.
+P_MAX_SCALE = 4.0
 # the delay bank re-races from scratch each drive; until it has run enough candidates to
 # mean anything, report the delay we resumed with rather than a half finished race
 DELAY_MIN_UPDATES = 200
@@ -144,6 +164,10 @@ class HondaSteerSample:
   lat_accel: float | None = None
   yaw_rate: float | None = None
   roll: float = 0.0
+  # False when the yaw/acceleration source is too stale to believe. The sample still
+  # advances the command history - dropping it outright would break the delay alignment,
+  # which counts samples - but nothing is fitted to it.
+  lat_accel_valid: bool = True
 
 
 @dataclass
@@ -172,6 +196,11 @@ class HondaSteeringModel:
   points: int = 0
   learned_buckets: int = 0
   valid: bool = False
+  # a fit that left the physically possible range, and how often that has happened. Both
+  # are published: a diverged fit must be visible, not silently replaced by the prior.
+  diverged: bool = False
+  resets: int = 0
+  asymmetry_learned: bool = False
 
   # Enough state to resume rather than restart. ``bucket_counts`` is which speed and
   # lateral acceleration cells have been covered; ``covariance`` is how sure each fit was.
@@ -268,8 +297,17 @@ class _RLS:
   def __init__(self, theta0, p0):
     self.theta = np.array(theta0, dtype=float)
     self.n = len(self.theta)
-    self.P = np.eye(self.n) * np.asarray(p0, dtype=float)
+    self.p0 = np.asarray(p0, dtype=float)
+    self.P = np.eye(self.n) * self.p0
+    self.p_max = self.p0 * P_MAX_SCALE
     self.points = 0
+
+  def reset(self, theta0=None) -> None:
+    """Back to the prior. Used when a fit has diverged: a diverged fit cannot recover on
+    its own, because every later sample is filtered through the broken estimate."""
+    if theta0 is not None:
+      self.theta = np.array(theta0, dtype=float)
+    self.P = np.eye(self.n) * self.p0
 
   def update(self, x, y: float, lam: float = FORGETTING_FACTOR) -> None:
     x = np.asarray(x, dtype=float)
@@ -282,7 +320,14 @@ class _RLS:
     self.P = (self.P - np.outer(K, Px)) / lam
     # keep the covariance symmetric and bounded so a long quiet highway stretch cannot
     # let it blow up and then over-react to the first curve
-    self.P = np.clip((self.P + self.P.T) / 2.0, -1e3, 1e3)
+    self.P = (self.P + self.P.T) / 2.0
+    # cap each direction at a multiple of its prior width: a direction the data never
+    # excites otherwise winds up until the first sample touching it moves it violently
+    d = np.diag(self.P)
+    if np.any(d > self.p_max):
+      scale = np.minimum(1.0, self.p_max / np.maximum(d, 1e-12))
+      r = np.sqrt(scale)
+      self.P = self.P * np.outer(r, r)
     self.points += 1
 
 
@@ -304,15 +349,15 @@ class _DelayBank:
     self.best = int(np.argmin(np.abs(np.array(self.candidates) - prior_delay)))
     self.delay = float(np.clip(prior_delay, MIN_DELAY, MAX_DELAY))
 
-  def update(self, x, cmd_at) -> None:
-    """``cmd_at(delay)`` returns the command issued ``delay`` seconds ago, or None."""
+  def update(self, build_x, y: float) -> None:
+    """``build_x(delay)`` returns the regressor using the command issued ``delay`` ago."""
     self.n += 1
     if self.n % DELAY_BANK_DECIMATION:
       return
     k = 1.0 / min(self.n / DELAY_BANK_DECIMATION, DELAY_RESIDUAL_TAU)
     for i, d in enumerate(self.candidates):
-      y = cmd_at(d)
-      if y is None:
+      x = build_x(d)
+      if x is None:
         continue
       err = (y - float(x @ self.rls[i].theta)) ** 2
       self.residual[i] = err if np.isnan(self.residual[i]) else self.residual[i] + k * (err - self.residual[i])
@@ -389,13 +434,23 @@ class HondaSteeringLearner:
     self.understeer_gradient = seed.understeer_gradient
 
     # Full model, theta = [1/K, friction, offset, asymmetry, tau/K] for y = torque_cmd.
-    # Only the delay bank fits all five at once - it just needs to compare candidates, and
-    # a split it gets wrong between friction and lag does not change which delay wins.
-    inv_k = 1.0 / max(seed.lat_accel_factor(20.0), 1e-3)
-    theta0 = [inv_k, seed.friction, seed.offset, seed.asymmetry, seed.response_tau * inv_k]
-    # a confident prior on gain and friction, a loose one on the bias terms
-    p0 = [0.5 * inv_k ** 2, 0.02, 0.05, 0.05, 0.05 * inv_k ** 2]
-    self.delay_bank = _DelayBank(theta0, p0, seed.actuator_delay, dt)
+    # The fit is oriented with the *command* as the regressor and the *measured* lateral
+    # acceleration as the dependent variable, matching torqued. The reverse - which this
+    # learner used until route 729a2e65b1f6201d showed what it does - puts the noisiest
+    # signal in the system on the regressor side, where its noise biases its own
+    # coefficient toward zero. That coefficient was 1/K, so the published gain 1/inv_k
+    # was driven upward without limit, to the 8.0 rail and beyond into negative inv_k.
+    #
+    #   a = K*u - K*offset - K*friction*sign - K*asym*max(u, 0) - tau*a_dot
+    #
+    # theta = [K, -K*offset, -K*friction, -K*asym] over x = [u, 1, sign, max(u, 0)],
+    # so the gain is read out directly, with no reciprocal to amplify anything.
+    k0 = max(seed.lat_accel_factor(20.0), 1e-3)
+    theta0 = [k0, -k0 * seed.offset, -k0 * seed.friction, -k0 * seed.asymmetry,
+              -seed.response_tau]
+    p0 = [0.5 * k0 ** 2, 0.05 * k0 ** 2, 0.02 * k0 ** 2, 0.05 * k0 ** 2, 0.02]
+    # the bank races the static model only; the lag term is fitted separately
+    self.delay_bank = _DelayBank(theta0[:4], p0[:4], seed.actuator_delay, dt)
     # static model: theta = [1/K, friction, offset, asymmetry], fitted on settled samples
     self.steady_rls = _RLS(theta0[:4], p0[:4])
     # Each speed bucket resumes from the seed's gain *at that speed*. Seeding them all
@@ -403,11 +458,17 @@ class HondaSteeringLearner:
     # speed dependence the schedule exists to capture.
     self.speed_rls = []
     for centre in speed_bucket_centres():
-      inv_k_i = 1.0 / max(seed.lat_accel_factor(centre), 1e-3)
-      self.speed_rls.append(_RLS([inv_k_i, seed.friction, seed.offset, seed.asymmetry],
-                                 [0.5 * inv_k_i ** 2, 0.02, 0.05, 0.05]))
+      k_i = max(seed.lat_accel_factor(centre), 1e-3)
+      self.speed_rls.append(_RLS([k_i, -k_i * seed.offset, -k_i * seed.friction,
+                                  -k_i * seed.asymmetry],
+                                 [0.5 * k_i ** 2, 0.05 * k_i ** 2, 0.02 * k_i ** 2,
+                                  0.05 * k_i ** 2]))
     # lag model: theta = [tau/K], fitted on moving samples with the static terms removed
     self.lag_rls = _RLS([theta0[4]], [p0[4]])
+    # asymmetry stays switched off until the command has been driven both ways
+    self._asym_enabled = False
+    self._asym_counts = [0, 0]
+    self.resets = 0
     self.bucket_counts = np.zeros((len(SPEED_BUCKET_EDGES) - 1,
                                    len(LAT_ACCEL_BUCKET_EDGES) - 1), dtype=int)
 
@@ -521,6 +582,12 @@ class HondaSteeringLearner:
     self._rate_filt += (s.steering_rate_deg - self._rate_filt) * self.dt / RACK_RATE_TAU
     self._cmd_history.append(s.torque_cmd)
 
+    if not s.lat_accel_valid:
+      # a stale yaw rate is a wrong lateral acceleration, and it is the regressor-side
+      # error that this model is least able to tolerate
+      self._accel_hist.clear()
+      return
+
     lat_accel = self._lat_accel(s)
     self._accel_hist.append(lat_accel)
     lat_jerk = 0.0
@@ -558,59 +625,115 @@ class HondaSteeringLearner:
     # toward zero. The linear region is narrow on top of that: too wide and gentle
     # steering never reaches full sign, too narrow and the remaining noise dithers it.
     sign = _smooth_sign(self._rate_filt, RACK_MOTION_DEADBAND)
-    x = np.array([lat_accel, sign, 1.0, max(lat_accel, 0.0), lat_jerk])
+
+    def build_x(delay: float):
+      u = self._cmd_at(delay)
+      if u is None:
+        return None
+      # the asymmetry column duplicates the command column while the command is
+      # one-signed, so it stays zeroed until both directions have been seen
+      asym = max(u, 0.0) if self._asym_enabled else 0.0
+      return np.array([u, 1.0, sign, asym])
 
     # a command the rack could not actually follow tells us nothing about the plant: the
     # motion it produced belongs to a smaller command than the one we recorded
     if abs(torque_cmd) >= self.prior.max_useful_torque - 1e-3:
       return
 
-    self.delay_bank.update(x, self._cmd_at)
+    x_static = build_x(self.delay_bank.delay)
+    if x_static is None:
+      return
+
+    self.delay_bank.update(build_x, lat_accel)
 
     if abs(lat_jerk) <= STEADY_JERK:
-      x_static = x[:4]
-      self.steady_rls.update(x_static, torque_cmd)
-      self.speed_rls[i_speed].update(x_static, torque_cmd)
+      self.steady_rls.update(x_static, lat_accel)
+      self.speed_rls[i_speed].update(x_static, lat_accel)
       self.bucket_counts[i_speed, i_accel] += 1
       self.points += 1
+      self._note_asymmetry_excitation(torque_cmd)
+      self._check_divergence()
     elif abs(lat_jerk) >= DYNAMIC_JERK:
-      # everything the static model already explains is subtracted, so what is left for
-      # the lag term to explain is the part of the command that leads the motion
-      residual = torque_cmd - float(x[:4] @ self.steady_rls.theta)
+      # what the static model cannot explain on a moving sample is the rack's lag
+      residual = lat_accel - float(x_static @ self.steady_rls.theta)
       self.lag_rls.update(np.array([lat_jerk]), residual)
 
+  def _note_asymmetry_excitation(self, torque_cmd: float) -> None:
+    """Enable the asymmetry column once the command has gone both ways enough times."""
+    if self._asym_enabled:
+      return
+    if torque_cmd > ASYM_MIN_CMD:
+      self._asym_counts[0] += 1
+    elif torque_cmd < -ASYM_MIN_CMD:
+      self._asym_counts[1] += 1
+    if min(self._asym_counts) >= ASYM_MIN_SAMPLES:
+      self._asym_enabled = True
+      # the column starts from nothing, so give it its prior width back rather than
+      # whatever the covariance happened to be while it sat unused
+      for rls in [self.steady_rls] + self.speed_rls:
+        rls.theta[3] = 0.0
+        rls.P[3, :] = 0.0
+        rls.P[:, 3] = 0.0
+        rls.P[3, 3] = rls.p0[3]
+
+  def _check_divergence(self) -> None:
+    """A fit that has left the physically possible range is reset, not published.
+
+    Once the gain is wrong every later sample is interpreted through it, so a diverged
+    fit does not recover on its own. Resetting costs the drive's learning; leaving it
+    costs a model that looks plausible and is not.
+    """
+    for rls in [self.steady_rls] + self.speed_rls:
+      if not (K_MIN_VALID <= rls.theta[0] <= K_MAX_VALID) or not np.isfinite(rls.theta).all():
+        rls.reset(theta0=[self.prior.lat_accel_factor(20.0), 0.0, 0.0, 0.0])
+        self.resets += 1
+
   # -- output -------------------------------------------------------------------------
-  def _factor_from(self, rls: _RLS) -> float:
-    inv_k = rls.theta[0]
-    if inv_k < 1e-3:
-      return self.prior.lat_accel_factor(20.0)
-    return float(np.clip(1.0 / inv_k, 0.3, 8.0))
+  def _factor_from(self, rls: _RLS) -> float | None:
+    """The gain this fit has measured, or None if it has not measured one.
+
+    None means "no answer", and the caller substitutes the prior. Returning the prior
+    from here instead - as this did until route 729a2e65b1f6201d - makes a diverged fit
+    and an unfitted one look identical in the published model, which is precisely what
+    stopped the divergence being visible.
+    """
+    k = float(rls.theta[0])
+    if not np.isfinite(k) or not (K_MIN_VALID <= k <= K_MAX_VALID):
+      return None
+    return k
 
   def model(self) -> HondaSteeringModel:
+    # theta is [K, -K*offset, -K*friction, -K*asym], so every derived term is divided
+    # back out by the gain that scaled it
+    k = self._factor_from(self.steady_rls)
+    scale = k if k is not None else self.prior.lat_accel_factor(20.0)
     m = HondaSteeringModel(
       fingerprint=self.fingerprint,
-      friction=float(np.clip(self.steady_rls.theta[1], 0.0, 0.4)),
-      offset=float(np.clip(self.steady_rls.theta[2], -0.3, 0.3)),
-      asymmetry=float(np.clip(self.steady_rls.theta[3], -0.5, 0.5)),
-      response_tau=float(np.clip(self.lag_rls.theta[0] * self._factor_from(self.steady_rls),
-                                 0.0, 0.6)),
+      friction=float(np.clip(-self.steady_rls.theta[2] / scale, 0.0, 0.4)),
+      offset=float(np.clip(-self.steady_rls.theta[1] / scale, -0.3, 0.3)),
+      asymmetry=float(np.clip(-self.steady_rls.theta[3] / scale, -0.5, 0.5)),
+      response_tau=float(np.clip(-self.lag_rls.theta[0], 0.0, 0.6)),
       actuator_delay=self.delay_bank.delay,
       steer_ratio=self.steer_ratio,
       understeer_gradient=self.understeer_gradient,
       driver_torque_threshold=self.override_est.threshold,
       points=self.points,
+      resets=self.resets,
+      diverged=k is None,
+      asymmetry_learned=self._asym_enabled,
     )
 
     # speed schedule: use a bucket's own fit once it has seen enough of the lat accel
     # range, otherwise fall back to the global fit so the schedule stays monotonic-ish
     bps, vs, learned_buckets = [], [], 0
+    prior_gain = self.prior.lat_accel_factor(20.0)
     for i, centre in enumerate(speed_bucket_centres()):
-      cells = self.bucket_counts[i]
-      if (cells >= MIN_POINTS_PER_BUCKET).sum() >= 2:
-        vs.append(self._factor_from(self.speed_rls[i]))
+      bucket = self._bucket_gain(i)
+      if bucket is not None:
+        vs.append(bucket)
         learned_buckets += 1
       else:
-        vs.append(self._factor_from(self.steady_rls))
+        vs.append(k if k is not None else prior_gain)
       bps.append(centre)
     m.lat_accel_factor_bp = bps
     m.lat_accel_factor_v = vs
@@ -625,5 +748,27 @@ class HondaSteeringLearner:
       "lag": self.lag_rls.P.tolist(),
     }
 
-    m.valid = self.points >= MIN_TOTAL_POINTS and learned_buckets >= 1
+    m.valid = (k is not None and self.points >= MIN_TOTAL_POINTS and learned_buckets >= 1
+               and self._excited(self.bucket_counts.sum(axis=0)))
     return m
+
+  def _bucket_gain(self, i: int) -> float | None:
+    """A speed bucket's own gain, or None when its coverage does not support one."""
+    cells = self.bucket_counts[i]
+    if (cells >= MIN_POINTS_PER_BUCKET).sum() < 2 or not self._excited(cells):
+      return None
+    return self._factor_from(self.speed_rls[i])
+
+  @staticmethod
+  def _excited(cells) -> bool:
+    """Whether the covered cells span enough lateral acceleration to fit anything.
+
+    Point count is not coverage. Route 729a2e65b1f6201d had 1150 points in one cell and
+    100 in its neighbour, which passed a count test easily and still described a band far
+    too narrow to separate gain from offset once measurement noise is accounted for.
+    """
+    covered = np.where(np.asarray(cells) >= MIN_POINTS_PER_BUCKET)[0]
+    if len(covered) < 2:
+      return False
+    span = LAT_ACCEL_BUCKET_EDGES[covered[-1] + 1] - LAT_ACCEL_BUCKET_EDGES[covered[0]]
+    return span >= MIN_LAT_ACCEL_SPAN
