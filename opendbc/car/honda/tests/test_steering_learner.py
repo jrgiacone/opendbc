@@ -547,19 +547,29 @@ class TestLagIsNotOverclaimed:
   to trade against the dead time, which is what lands their sum in the right place.
   """
 
-  def test_a_flat_race_keeps_the_prior(self):
-    """No command at all: every candidate explains the data identically."""
+  def test_a_flat_race_is_not_called_a_measurement(self):
+    """No command at all: every candidate explains the data identically.
+
+    The delay is still published - the static fit has to align on something, and holding
+    it at the prior contaminates gain, friction and offset instead - but delay_learned
+    has to say that nothing was actually learned.
+    """
     CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
     learner = HondaSteeringLearner(CP, dt=DT)
-    prior_delay = learner.delay_bank.delay
     for i in range(20000):
       learner.update(HondaSteerSample(
         t=i * DT, v_ego=20.0, torque_cmd=0.0, steering_angle_deg=0.0,
         steering_rate_deg=0.0, lat_active=True, lat_accel=0.0, lat_accel_valid=True))
     m = learner.model()
-    assert m.actuator_delay == pytest.approx(prior_delay)
     assert not m.delay_learned, "an unwon race must not be published as a measurement"
-    assert not m.delay_railed
+    assert MIN_DELAY <= m.actuator_delay <= MAX_DELAY
+
+  def test_a_won_race_is_called_a_measurement(self):
+    """A plant with a real dead time, driven hard enough to find it."""
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+    truth = HondaPlantTruth.for_car(CP)
+    ctrl, _ = drive(CP, truth)
+    assert ctrl.learner.model().delay_learned
 
   def test_a_real_lag_still_clears_the_bar(self):
     """The gate must not block a lag the data genuinely supports.

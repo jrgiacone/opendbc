@@ -139,10 +139,16 @@ DELAY_MIN_UPDATES = 200
 # noise and excitation - leaves a residual surface with 0.6% total leverage on dead time
 # and 0.2% on tau, sliding monotonically into the corner of the grid rather than settling
 # anywhere. Against 578% and 224% on the synthetic, that is around a thousand times less
-# structure than identification needs, and an argmin over it is a coin toss. Note this
-# gates only what is *published*: the bank keeps racing, and the fit keeps its freedom to
-# trade dead time against tau, which is what lands their sum in the right place even when
-# the split between them is arbitrary.
+# structure than identification needs, and an argmin over it is a coin toss.
+#
+# This is a reporting rule and nothing more: the winner is still used, because the delay
+# the static fit aligns on is not a free choice. A misaligned command contaminates gain,
+# friction and offset - holding the delay at the prior on a plant whose real delay is
+# elsewhere inverted the learned speed schedule outright in test_learns_speed_schedule,
+# on a phase error too small to show in the residual. So the bank keeps racing and keeps
+# aligning on what it finds; delay_learned says whether that winner was ever meaningfully
+# better than the prior's own candidate, so a log can tell a measurement from a coin toss
+# without the model having to pretend it knows less than it does.
 DELAY_MIN_IMPROVEMENT = 0.05
 
 # --- delay estimation ----------------------------------------------------------------
@@ -246,11 +252,11 @@ class HondaSteeringModel:
   # the compensation was trusted on, and how well the command tracks the fitted target
   # with it applied against the uncompensated one. Published so the fleet can settle
   # whether subtracting the roll estimate helps this signal or hurts it.
-  # Whether the dead time is a measurement or the prior it started from, and whether the
-  # winning candidate sat on an end of the bank's grid. A delay that never cleared
-  # DELAY_MIN_IMPROVEMENT is the prior wearing a learned model's clothes, which is the
-  # failure this learner exists to stop making. ``effective_lag`` is unaffected either
-  # way: it is the sum, and the sum is what the data determines.
+  # Whether ``actuator_delay`` won its race by enough to be called a measurement, and
+  # whether the winning candidate sat on an end of the bank's grid. The delay is published
+  # either way, because the fit has to align on something; these say how much to believe
+  # it. ``effective_lag`` is the figure to use regardless: it is the sum, and the sum is
+  # what the data determines.
   delay_learned: bool = False
   delay_railed: bool = False
 
@@ -451,13 +457,9 @@ class _DelayBank:
     reference = self.residual[self.prior_index]
     improvement = 0.0 if not np.isfinite(reference) or reference <= 0.0 else \
         1.0 - self.residual[best] / reference
-    if improvement < DELAY_MIN_IMPROVEMENT:
-      self.best = self.prior_index; self.delay = self.prior_delay
-      self.railed = False; self.learned = False
-      return
     self.best = best
     self.railed = best in (0, len(self.candidates) - 1)
-    self.learned = True
+    self.learned = improvement >= DELAY_MIN_IMPROVEMENT
     self.delay = self._interpolated()
 
   def _interpolated(self) -> float:
