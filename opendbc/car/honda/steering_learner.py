@@ -97,6 +97,35 @@ ASYM_MIN_SAMPLES = 200
 # count: the signal has to span enough range to outweigh the error on it.
 MIN_LAT_ACCEL_SPAN = 1.3
 
+# --- roll compensation ---------------------------------------------------------------
+# Road roll enters the yaw-derived lateral acceleration as sin(roll)*9.81 and is supposed
+# to be removed before fitting. On gentle lane keeping the estimate is not small enough
+# relative to the signal for that to be free. Measured over the 76650 gated samples of
+# route 729a2e65b1f6201d/00000010:
+#
+#   yaw-derived lat accel            sigma 0.207 m/s^2
+#   roll compensation                sigma 0.221 m/s^2   (1.07x the signal)
+#   corr(lat accel, roll comp)              -0.298
+#   corr(torque_cmd, lat accel)             +0.191
+#   corr(torque_cmd, lat accel - roll comp) +0.114
+#
+# Subtracting it raised the target's variance and cost 40% of the correlation with the
+# command: on that route the compensation carried more error than road roll. So it is
+# applied only where the estimate is quiet enough to believe, and the crown it leaves
+# behind is picked up by ``offset``, which is what that term is for. Both correlations
+# are tracked and published so the fleet answers this with data rather than with one
+# route's numbers.
+# Superelevation on ordinary roads tops out near 10%, i.e. sin(0.1)*9.81 = 0.98 m/s^2.
+# A compensation larger than that is not road crown, it is the estimate.
+MAX_ROLL_COMPENSATION = 1.0
+# Road crown changes over seconds, so the estimate moving faster than this is the
+# localizer settling rather than the road banking. Measured against a low passed roll:
+# the raw estimate arrives at 20 Hz and is held between updates, so differentiating it
+# at the learner's rate reads zero on most samples and a spike on the rest.
+MAX_ROLL_RATE = 0.05           # rad/s
+ROLL_RATE_TAU = 0.5            # s of low pass before the rate is taken
+ROLL_CORR_TAU = 20000.0        # samples of averaging on the published correlations
+
 # No direction of the covariance may wind up beyond this multiple of its prior width. An
 # unexcited direction otherwise grows until the first sample that touches it lands with
 # enormous gain.
@@ -201,6 +230,14 @@ class HondaSteeringModel:
   diverged: bool = False
   resets: int = 0
   asymmetry_learned: bool = False
+
+  # Evidence about roll compensation rather than about the car: what fraction of samples
+  # the compensation was trusted on, and how well the command tracks the fitted target
+  # with it applied against the uncompensated one. Published so the fleet can settle
+  # whether subtracting the roll estimate helps this signal or hurts it.
+  roll_comp_fraction: float = 0.0
+  lat_accel_torque_corr: float = 0.0
+  lat_accel_torque_corr_raw: float = 0.0
 
   # Enough state to resume rather than restart. ``bucket_counts`` is which speed and
   # lateral acceleration cells have been covered; ``covariance`` is how sure each fit was.
@@ -389,6 +426,39 @@ class _DelayBank:
     return self.rls[self.best]
 
 
+class _StreamingCorrelation:
+  """Exponentially weighted correlation between two streams.
+
+  Published as evidence, not used in any fit: it is the only way to tell from a log
+  whether a preprocessing step helped or hurt the thing it feeds.
+  """
+
+  def __init__(self, tau: float):
+    self.tau = tau
+    self.n = 0
+    self.mx = 0.0
+    self.my = 0.0
+    self.vx = 0.0
+    self.vy = 0.0
+    self.cxy = 0.0
+
+  def update(self, x: float, y: float) -> None:
+    self.n += 1
+    k = 1.0 / min(self.n, self.tau)
+    dx, dy = x - self.mx, y - self.my
+    self.mx += k * dx
+    self.my += k * dy
+    self.vx += k * (dx * dx - self.vx)
+    self.vy += k * (dy * dy - self.vy)
+    self.cxy += k * (dx * dy - self.cxy)
+
+  @property
+  def value(self) -> float:
+    if self.n < 2 or self.vx <= 0.0 or self.vy <= 0.0:
+      return 0.0
+    return float(np.clip(self.cxy / math.sqrt(self.vx * self.vy), -1.0, 1.0))
+
+
 class _OverrideThresholdEstimator:
   """Learns the driver torque noise floor, i.e. ``values.py::STEER_THRESHOLD`` per car."""
 
@@ -469,6 +539,13 @@ class HondaSteeringLearner:
     self._asym_enabled = False
     self._asym_counts = [0, 0]
     self.resets = 0
+    # roll compensation bookkeeping and the evidence for whether it is worth applying
+    self._roll_filt: float | None = None
+    self._raw_lat_accel = 0.0
+    self.roll_comp_applied = 0
+    self.roll_comp_skipped = 0
+    self.corr_compensated = _StreamingCorrelation(ROLL_CORR_TAU)
+    self.corr_raw = _StreamingCorrelation(ROLL_CORR_TAU)
     self.bucket_counts = np.zeros((len(SPEED_BUCKET_EDGES) - 1,
                                    len(LAT_ACCEL_BUCKET_EDGES) - 1), dtype=int)
 
@@ -546,6 +623,32 @@ class HondaSteeringLearner:
       return None
     return self._cmd_history[len(self._cmd_history) - 1 - n]
 
+  def _roll_compensation(self, s: HondaSteerSample) -> float:
+    """The roll term to subtract, or zero where the estimate is not worth believing.
+
+    Two ways for the estimate to be wrong in a way that costs more than the roll it
+    removes: too large to be road crown, or moving too fast to be road crown. A settling
+    or resetting localizer produces both. What is skipped here is a slowly varying bias,
+    which is exactly what ``offset`` absorbs.
+
+    This catches a pathological estimate, not a merely imprecise one. On route
+    729a2e65b1f6201d the compensation cost 40% of the correlation between command and
+    fitted target while staying inside both limits, and no threshold on magnitude or rate
+    separates the harmful samples cleanly - the loss is not monotonic in either. Whether
+    the compensation belongs in the fit at all is what the published correlations are
+    for; tuning these limits to one route's shape would be fitting the route.
+    """
+    comp = math.sin(s.roll) * 9.81
+    if self._roll_filt is None:
+      self._roll_filt = s.roll
+    prev, self._roll_filt = self._roll_filt, self._roll_filt + (s.roll - self._roll_filt) * self.dt / ROLL_RATE_TAU
+    rate = abs(self._roll_filt - prev) / self.dt
+    if abs(comp) > MAX_ROLL_COMPENSATION or rate > MAX_ROLL_RATE:
+      self.roll_comp_skipped += 1
+      return 0.0
+    self.roll_comp_applied += 1
+    return comp
+
   def _lat_accel(self, s: HondaSteerSample) -> float:
     """Measured lateral acceleration, roll compensated, from the best source available."""
     if s.lat_accel is not None:
@@ -555,7 +658,8 @@ class HondaSteeringLearner:
     else:
       curvature = math.radians(s.steering_angle_deg) / (self.steer_ratio * self.wheelbase)
       a = curvature * s.v_ego ** 2
-    return float(a - math.sin(s.roll) * 9.81)
+    self._raw_lat_accel = float(a)
+    return float(a - self._roll_compensation(s))
 
   # -- main ---------------------------------------------------------------------------
   def update(self, s: HondaSteerSample) -> None:
@@ -647,6 +751,10 @@ class HondaSteeringLearner:
     self.delay_bank.update(build_x, lat_accel)
 
     if abs(lat_jerk) <= STEADY_JERK:
+      # the same samples the static model is fitted on, scored both ways: whichever
+      # target tracks the command better is the one the fit should be using
+      self.corr_compensated.update(torque_cmd, lat_accel)
+      self.corr_raw.update(torque_cmd, self._raw_lat_accel)
       self.steady_rls.update(x_static, lat_accel)
       self.speed_rls[i_speed].update(x_static, lat_accel)
       self.bucket_counts[i_speed, i_accel] += 1
@@ -710,7 +818,9 @@ class HondaSteeringLearner:
     m = HondaSteeringModel(
       fingerprint=self.fingerprint,
       friction=float(np.clip(-self.steady_rls.theta[2] / scale, 0.0, 0.4)),
-      offset=float(np.clip(-self.steady_rls.theta[1] / scale, -0.3, 0.3)),
+      # wider than it was: a skipped roll compensation leaves its crown here, and the
+      # old +-0.3 was already railing on route 729a2e65b1f6201d with the compensation on
+      offset=float(np.clip(-self.steady_rls.theta[1] / scale, -0.5, 0.5)),
       asymmetry=float(np.clip(-self.steady_rls.theta[3] / scale, -0.5, 0.5)),
       response_tau=float(np.clip(-self.lag_rls.theta[0], 0.0, 0.6)),
       actuator_delay=self.delay_bank.delay,
@@ -721,6 +831,9 @@ class HondaSteeringLearner:
       resets=self.resets,
       diverged=k is None,
       asymmetry_learned=self._asym_enabled,
+      roll_comp_fraction=self._roll_comp_fraction(),
+      lat_accel_torque_corr=self.corr_compensated.value,
+      lat_accel_torque_corr_raw=self.corr_raw.value,
     )
 
     # speed schedule: use a bucket's own fit once it has seen enough of the lat accel
@@ -751,6 +864,10 @@ class HondaSteeringLearner:
     m.valid = (k is not None and self.points >= MIN_TOTAL_POINTS and learned_buckets >= 1
                and self._excited(self.bucket_counts.sum(axis=0)))
     return m
+
+  def _roll_comp_fraction(self) -> float:
+    seen = self.roll_comp_applied + self.roll_comp_skipped
+    return float(self.roll_comp_applied / seen) if seen else 0.0
 
   def _bucket_gain(self, i: int) -> float | None:
     """A speed bucket's own gain, or None when its coverage does not support one."""

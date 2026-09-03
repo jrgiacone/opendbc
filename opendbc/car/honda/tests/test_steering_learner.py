@@ -458,3 +458,79 @@ def test_model_round_trips():
   assert HondaSteeringModel.from_json(m.to_json()) == m
   with pytest.raises(ValueError):
     HondaSteeringModel.from_dict({"version": 999})
+
+
+class TestRollCompensationGate:
+  """Roll enters the fitted target as sin(roll)*9.81, so a bad estimate is not a small
+  error: on route 729a2e65b1f6201d it had a standard deviation 1.07x the lateral
+  acceleration signal itself. The gate rejects an estimate that cannot be road crown; the
+  published correlations are what decide whether the compensation belongs in the fit."""
+
+  @staticmethod
+  def _learner():
+    return HondaSteeringLearner(CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022), dt=DT)
+
+  @staticmethod
+  def _sample(roll, **kw):
+    return HondaSteerSample(t=0.0, v_ego=20.0, torque_cmd=0.2, steering_angle_deg=1.0,
+                            steering_rate_deg=0.0, lat_active=True, yaw_rate=0.05,
+                            roll=roll, lat_accel_valid=True, **kw)
+
+  def test_a_plausible_roll_is_applied(self):
+    learner = self._learner()
+    roll = 0.02                                   # ~1.1 deg of crown, 0.20 m/s^2
+    settled = learner._lat_accel(self._sample(roll))
+    for _ in range(200):                          # let the rate filter settle
+      settled = learner._lat_accel(self._sample(roll))
+    assert settled == pytest.approx(0.05 * 20.0 - math.sin(roll) * 9.81, abs=1e-6)
+    assert learner.roll_comp_applied > 0
+
+  def test_an_implausibly_large_roll_is_skipped(self):
+    """Superelevation tops out near 10%; anything past that is the estimate, not the road."""
+    learner = self._learner()
+    roll = 0.5                                    # 4.7 m/s^2, five times any real crown
+    a = learner._lat_accel(self._sample(roll))
+    assert a == pytest.approx(0.05 * 20.0, abs=1e-6), "the compensation must not be applied"
+    assert learner.roll_comp_skipped == 1
+
+  def test_a_roll_estimate_that_is_still_settling_is_skipped(self):
+    """A localizer converging looks like the road banking at an impossible rate."""
+    learner = self._learner()
+    skipped_before = learner.roll_comp_skipped
+    for i in range(50):                           # 0.6 rad/s, an order of magnitude too fast
+      learner._lat_accel(self._sample(i * 0.6 * DT))
+    assert learner.roll_comp_skipped > skipped_before
+
+  def test_the_gate_is_reported(self):
+    learner = self._learner()
+    for _ in range(100):
+      learner._lat_accel(self._sample(0.02))
+    for _ in range(100):
+      learner._lat_accel(self._sample(0.5))
+    assert learner.model().roll_comp_fraction == pytest.approx(0.5, abs=0.02)
+
+  def test_both_correlations_are_published(self):
+    """The compensated and uncompensated targets are scored against the same command, so
+    a log says whether removing the roll estimate helped or hurt."""
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+    learner = HondaSteeringLearner(CP, dt=DT)
+    gain, v_ego = 2.0, 20.0
+    rng = np.random.default_rng(0)
+    cmd = 0.0
+    for i in range(20000):
+      cmd = float(np.clip(cmd + (rng.normal(0.0, 0.25) - cmd) * 0.01, -0.6, 0.6))
+      # a pure command response, with a roll estimate that is nothing but noise
+      lat_accel = gain * cmd
+      roll = float(rng.normal(0.0, 0.01))
+      learner.update(HondaSteerSample(
+        t=i * DT, v_ego=v_ego, torque_cmd=cmd,
+        steering_angle_deg=math.degrees(lat_accel / v_ego ** 2 * learner.steer_ratio * learner.wheelbase),
+        steering_rate_deg=0.0, lat_active=True,
+        yaw_rate=(lat_accel + math.sin(roll) * 9.81) / v_ego, roll=roll, lat_accel_valid=True,
+      ))
+
+    m = learner.model()
+    # the roll here is real, so removing it must leave the command tracking the target
+    # at least as well as leaving it in
+    assert m.lat_accel_torque_corr > 0.5
+    assert m.lat_accel_torque_corr >= m.lat_accel_torque_corr_raw
