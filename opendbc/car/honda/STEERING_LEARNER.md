@@ -81,7 +81,7 @@ Three further details make it work on the gentle steering openpilot actually doe
 
 Samples are bucketed by speed × lateral acceleration and the model only reports `valid`
 once several cells are populated **and they span at least 1.3 m/s²**. Point count is not
-coverage: the failing route had 1150 points in one cell and 100 in its neighbour, which
+coverage: the failing route had 1150 points in one cell and 100 in its neighbor, which
 passes any count test and still describes a band too narrow to separate gain from offset.
 
 Three things are refused rather than guessed:

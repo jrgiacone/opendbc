@@ -17,7 +17,7 @@ from opendbc.car.honda.steering_learner import (
 from opendbc.car.honda.tests.honda_steer_plant import HondaPlant, HondaPlantTruth
 from opendbc.car.honda.values import CAR
 
-# The learner is parameterised by its step time; the fleet sweep runs at 50 Hz, which
+# The learner is parameterized by its step time; the fleet sweep runs at 50 Hz, which
 # halves what is a very long test and exercises that dt independence. test_learns_at_100hz
 # covers the rate Honda control actually runs at.
 DT = 0.02
@@ -30,7 +30,7 @@ class approx:
   Lowercase deliberately: it reads as a value at the call site, not as a class.
 
   opendbc runs its tests under ``unittest-parallel`` and has no pytest dependency, so
-  ``pytest.approx`` is not available here. This covers the part of its behaviour these
+  ``pytest.approx`` is not available here. This covers the part of its behavior these
   tests use: the same default tolerances (rel=1e-6, abs=1e-12), an ``abs``-only mode, and
   element-wise comparison of a sequence.
   """
@@ -104,13 +104,15 @@ class TestFleet(unittest.TestCase):
     """The prior must actually separate the fleet, not collapse to one number."""
     factors = {c: prior_from_car_params(CarInterface.get_non_essential_params(c)).lat_accel_factor(20.)
                for c in ALL_CARS}
-    assert len(set(round(f, 3) for f in factors.values())) > len(ALL_CARS) // 2
+    assert len({round(f, 3) for f in factors.values()}) > len(ALL_CARS) // 2
     # the lightest car in the fleet should need the least torque per m/s^2, the heaviest
     # the most
     specs = {c: CarInterface.get_non_essential_params(c).mass for c in ALL_CARS}
-    heaviest = sorted(specs, key=specs.get)[-3:]
-    assert max(factors, key=factors.get) == min(specs, key=specs.get)
-    assert min(factors, key=factors.get) in heaviest
+    # __getitem__ rather than .get as the sort key: .get is typed as returning
+    # `float | None`, which is not comparable, so sorted/max/min have no matching overload
+    heaviest = sorted(specs, key=specs.__getitem__)[-3:]
+    assert max(factors, key=factors.__getitem__) == min(specs, key=specs.__getitem__)
+    assert min(factors, key=factors.__getitem__) in heaviest
 
   def test_learns_gain_and_friction(self):
     """The learner recovers each car's true EPS gain from a plant it was not primed on."""
@@ -158,7 +160,7 @@ class TestFleet(unittest.TestCase):
             plant.step(torque, v)
             if t > 20.0:
               errs.append(desired - plant.lat_accel)
-          return float(np.sqrt(np.mean(np.square(errs))))
+          return float(np.sqrt(np.square(errs).sum() / len(errs)))
 
         learned_rms, prior_rms = rms(learned), rms(None)
         prior_error = abs(trained.prior.lat_accel_factor(22.0) / truth.lat_accel_factor - 1.0)
@@ -388,9 +390,9 @@ class TestNoisyMeasurement(unittest.TestCase):
     t, held, last_hold = 0.0, 0.0, -1e9
     while t < seconds:
       t += DT
-      centre = (-0.55 if (t < seconds * 0.8 or not flip) else 0.55) if one_signed else 0.0
+      center = (-0.55 if (t < seconds * 0.8 or not flip) else 0.55) if one_signed else 0.0
       amp = 0.08 if one_signed else 1.6
-      a = centre + amp * math.sin(2 * math.pi * t / 9.0)
+      a = center + amp * math.sin(2 * math.pi * t / 9.0)
       a_dot = amp * 2 * math.pi / 9.0 * math.cos(2 * math.pi * t / 9.0)
       u = a / truth_k + tau * a_dot / truth_k + offset + friction * np.sign(a_dot)
       measured = a + rng.normal(0.0, noise)

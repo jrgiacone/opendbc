@@ -31,7 +31,7 @@ class HondaPlantTruth:
   wheelbase: float
 
   @staticmethod
-  def for_car(CP, seed: int = 0) -> "HondaPlantTruth":
+  def for_car(CP, seed: int = 0) -> HondaPlantTruth:
     """Plausible-but-not-prior truth for one platform, deterministic in ``seed``."""
     rng = np.random.default_rng(zlib.crc32(f"{CP.carFingerprint}:{seed}".encode()))
     # Same shape as the prior, so the truth stays a plausible Honda rack; what makes this
@@ -76,7 +76,7 @@ class HondaPlant:
     # Direction comes from a filtered rack speed. Keying Coulomb friction off the raw
     # per-sample rate makes the discrete plant limit-cycle at Nyquist (the friction term
     # flips sign every step and drives the oscillation it is reacting to), which is a
-    # numerical artefact, not something a real rack does.
+    # numerical artifact, not something a real rack does.
     self.rate_filt += (self.rate_deg - self.rate_filt) * self.dt / FRICTION_DIRECTION_TAU
     if abs(self.rate_filt) > 0.5:
       self.direction = float(np.sign(self.rate_filt))
