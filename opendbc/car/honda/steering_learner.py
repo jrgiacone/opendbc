@@ -44,7 +44,12 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
-MODEL_VERSION = 2
+# Bumped to 3 when APPLY_ROLL_COMPENSATION was turned off. A cached model is not just
+# resumed state, it seeds steady_rls, every speed_rls, the delay bank and the lag model,
+# so a cache fitted against the roll compensated target would carry that target's offset
+# and asymmetry into a fit that no longer uses it. Version 2 caches are discarded rather
+# than resumed; the cost is one drive of relearning per car, once.
+MODEL_VERSION = 3
 
 # --- sample gating -------------------------------------------------------------------
 MIN_LEARN_SPEED = 8.0          # m/s, below this Honda EPS assist is too nonlinear to fit
