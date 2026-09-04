@@ -395,6 +395,38 @@ class TestNoisyMeasurement:
     # with nothing measured, the published gain is the prior - but flagged, not silent
     assert m.lat_accel_factor(22.0) == pytest.approx(learner.prior.lat_accel_factor(22.0))
 
+  def test_a_railed_secondary_term_is_surfaced_not_masked(self):
+    """friction/offset/asymmetry are clipped before publishing same as the gain is - a fit
+    that has genuinely left the physically possible range is a diverged fit too, even with
+    the gain itself still in range.
+
+    Route 729a2e65b1f6201d/00000011 published asymmetry pinned at the +0.5 publish-clip
+    rail for the back third of a 40 minute drive with ``diverged`` reporting False
+    throughout, because only the gain fed it.
+    """
+    learner = self.feed(noise=0.0, one_signed=False)
+    assert learner.model().valid
+    assert not learner.model().diverged
+    # push the asymmetry term well past ASYMMETRY_MAX_VALID; gain is untouched
+    learner.steady_rls.theta[3] = -10.0 * learner.steady_rls.theta[0]
+    m = learner.model()
+    assert m.asymmetry == pytest.approx(0.5), "still clipped for publishing"
+    assert m.diverged, "a fit railed past ASYMMETRY_MAX_VALID must be flagged, not silently clipped"
+    assert not m.valid, "a diverged fit must never be published as converged"
+
+  def test_ordinary_fit_noise_does_not_trip_divergence(self):
+    """A term merely brushing its publish-clip boundary is not the same as one that has
+    left the physically possible range - only the wider *_MIN_VALID/*_MAX_VALID bounds
+    (mirroring K_MIN_VALID/K_MAX_VALID) should mark a fit diverged."""
+    learner = self.feed(noise=0.0, one_signed=False)
+    m = learner.model()
+    assert not m.diverged
+    # sits right at the publish-clip edge, well inside FRICTION_MIN_VALID/MAX_VALID
+    learner.steady_rls.theta[2] = -0.45 * learner.steady_rls.theta[0]
+    m = learner.model()
+    assert m.friction == pytest.approx(0.4)
+    assert not m.diverged, "brushing the publish-clip bound alone must not read as diverged"
+
   def test_divergence_resets_rather_than_persisting(self):
     learner = self.feed(noise=0.0, one_signed=False)
     before = learner.resets
@@ -402,6 +434,36 @@ class TestNoisyMeasurement:
     learner._check_divergence()
     assert learner.resets == before + 1
     assert learner.steady_rls.theta[0] == pytest.approx(learner.prior.lat_accel_factor(20.0))
+
+  def test_a_railed_secondary_term_resets_only_itself(self):
+    """A friction/offset/asymmetry divergence must recover, not stay flagged forever - and
+    must not throw away a gain, or the other two terms, that are still sound."""
+    learner = self.feed(noise=0.0, one_signed=False)
+    k_before = learner.steady_rls.theta[0]
+    offset_before = learner.steady_rls.theta[1]
+    before = learner.resets
+    # push only the asymmetry term past ASYMMETRY_MAX_VALID
+    learner.steady_rls.theta[3] = -10.0 * k_before
+    learner._check_divergence()
+    assert learner.resets == before + 1
+    assert learner.steady_rls.theta[3] == 0.0, "the railed column resets to nothing measured"
+    assert learner.steady_rls.theta[0] == pytest.approx(k_before), "gain is untouched"
+    assert learner.steady_rls.theta[1] == pytest.approx(offset_before), "offset is untouched"
+    assert not learner.model().diverged, "a reset column is no longer railed"
+
+  def test_a_railed_steer_ratio_resets_rather_than_persisting(self):
+    """Steer ratio is a separate fit (``sr_rls``) from the torque model, but the same
+    failure mode applies: a fit that has left the physically possible range must recover,
+    not be clipped and published as if it were a measurement forever."""
+    learner = self.feed(noise=0.0, one_signed=False)
+    before = learner.resets
+    learner.sr_rls.theta[0] = 50.0  # past STEER_RATIO_MAX_VALID
+    # one more accepted sample is enough: the check runs on every sr_rls update
+    learner.update(HondaSteerSample(t=1e6, v_ego=22.0, torque_cmd=0.1, steering_angle_deg=1.0,
+                                    steering_rate_deg=0.0, lat_active=True, lat_accel=0.2))
+    assert learner.resets == before + 1
+    assert learner.sr_rls.theta[0] == pytest.approx(learner.prior.steer_ratio)
+    assert learner.steer_ratio == pytest.approx(learner.prior.steer_ratio)
 
   def test_asymmetry_waits_for_both_directions(self):
     """max(u, 0) duplicates the command column while the command is one-signed."""
@@ -437,6 +499,32 @@ class TestNoisyMeasurement:
                                       steering_rate_deg=5.0, lat_active=True, lat_accel=a,
                                       lat_accel_valid=False))
     assert learner.points == 0
+
+  def test_saturated_fraction_is_evidence_not_a_fit_input(self):
+    """max_useful_torque is carried from the prior, not learned; saturated_fraction is the
+    evidence for whether that is actually limiting this car, without ever changing it."""
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+    learner = HondaSteeringLearner(CP, dt=DT)
+    assert learner.model().saturated_fraction == 0.0, "no data yet"
+
+    for i in range(1000):
+      t = i * DT
+      saturated = i % 4 == 0   # exactly a quarter of samples
+      learner.update(HondaSteerSample(t=t, v_ego=22.0, torque_cmd=1.0 if saturated else 0.1,
+                                      steering_angle_deg=0.0, steering_rate_deg=0.0,
+                                      lat_active=True, saturated=saturated))
+    assert learner.model().saturated_fraction == pytest.approx(0.25)
+
+    before = learner.model().saturated_fraction
+    for i in range(1000):
+      # disengaged and pressed samples must not count, saturated or not
+      learner.update(HondaSteerSample(t=1000 * DT + i * DT, v_ego=22.0, torque_cmd=1.0,
+                                      steering_angle_deg=0.0, steering_rate_deg=0.0,
+                                      lat_active=False, saturated=True))
+      learner.update(HondaSteerSample(t=1000 * DT + i * DT, v_ego=22.0, torque_cmd=1.0,
+                                      steering_angle_deg=0.0, steering_rate_deg=0.0,
+                                      lat_active=True, steering_pressed=True, saturated=True))
+    assert learner.model().saturated_fraction == pytest.approx(before)
 
 
 class TestCovarianceWindup:
