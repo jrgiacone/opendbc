@@ -500,6 +500,32 @@ class TestNoisyMeasurement:
                                       lat_accel_valid=False))
     assert learner.points == 0
 
+  def test_saturated_fraction_is_evidence_not_a_fit_input(self):
+    """max_useful_torque is carried from the prior, not learned; saturated_fraction is the
+    evidence for whether that is actually limiting this car, without ever changing it."""
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+    learner = HondaSteeringLearner(CP, dt=DT)
+    assert learner.model().saturated_fraction == 0.0, "no data yet"
+
+    for i in range(1000):
+      t = i * DT
+      saturated = i % 4 == 0   # exactly a quarter of samples
+      learner.update(HondaSteerSample(t=t, v_ego=22.0, torque_cmd=1.0 if saturated else 0.1,
+                                      steering_angle_deg=0.0, steering_rate_deg=0.0,
+                                      lat_active=True, saturated=saturated))
+    assert learner.model().saturated_fraction == pytest.approx(0.25)
+
+    before = learner.model().saturated_fraction
+    for i in range(1000):
+      # disengaged and pressed samples must not count, saturated or not
+      learner.update(HondaSteerSample(t=1000 * DT + i * DT, v_ego=22.0, torque_cmd=1.0,
+                                      steering_angle_deg=0.0, steering_rate_deg=0.0,
+                                      lat_active=False, saturated=True))
+      learner.update(HondaSteerSample(t=1000 * DT + i * DT, v_ego=22.0, torque_cmd=1.0,
+                                      steering_angle_deg=0.0, steering_rate_deg=0.0,
+                                      lat_active=True, steering_pressed=True, saturated=True))
+    assert learner.model().saturated_fraction == pytest.approx(before)
+
 
 class TestCovarianceWindup:
   def test_no_direction_winds_up_without_data(self):

@@ -296,6 +296,12 @@ class HondaSteeringModel:
   lat_accel_torque_corr: float = 0.0
   lat_accel_torque_corr_raw: float = 0.0
 
+  # Fraction of active, unpressed samples where the command sent was saturated.
+  # max_useful_torque is carried from the prior, not learned - see the module docstring -
+  # so this is the evidence for whether that is actually limiting real driving on this car,
+  # without ever needing the controller to overdrive the rack to find out.
+  saturated_fraction: float = 0.0
+
   # Enough state to resume rather than restart. ``bucket_counts`` is which speed and
   # lateral acceleration cells have been covered; ``covariance`` is how sure each fit was.
   # Neither is published: they are for the next ignition, not for reading.
@@ -630,6 +636,9 @@ class HondaSteeringLearner:
     self._raw_lat_accel = 0.0
     self.roll_comp_applied = 0
     self.roll_comp_skipped = 0
+    # evidence for whether max_useful_torque is limiting real driving; see update()
+    self._active_samples = 0
+    self._saturated_samples = 0
     self.corr_compensated = _StreamingCorrelation(ROLL_CORR_TAU)
     self.corr_raw = _StreamingCorrelation(ROLL_CORR_TAU)
     self.bucket_counts = np.zeros((len(SPEED_BUCKET_EDGES) - 1,
@@ -764,7 +773,13 @@ class HondaSteeringLearner:
 
     self.override_est.update(s.driver_torque)
 
+    # evidence for whether max_useful_torque is actually limiting real driving, not a fit:
+    # the value itself is carried from the prior deliberately (see the module docstring) -
+    # a controller that never overdrives the rack produces no evidence of where it gives
+    # up, so this is the only thing that can be measured without changing that
+    self._active_samples += 1
     if s.saturated:
+      self._saturated_samples += 1
       self._active_for = 0.0
     else:
       self._active_for += self.dt
@@ -973,6 +988,7 @@ class HondaSteeringLearner:
       roll_comp_fraction=self._roll_comp_fraction(),
       lat_accel_torque_corr=self.corr_compensated.value,
       lat_accel_torque_corr_raw=self.corr_raw.value,
+      saturated_fraction=self._saturated_fraction(),
     )
 
     # speed schedule: use a bucket's own fit once it has seen enough of the lat accel
@@ -1007,6 +1023,9 @@ class HondaSteeringLearner:
   def _roll_comp_fraction(self) -> float:
     seen = self.roll_comp_applied + self.roll_comp_skipped
     return float(self.roll_comp_applied / seen) if seen else 0.0
+
+  def _saturated_fraction(self) -> float:
+    return float(self._saturated_samples / self._active_samples) if self._active_samples else 0.0
 
   def _bucket_gain(self, i: int) -> float | None:
     """A speed bucket's own gain, or None when its coverage does not support one."""
