@@ -451,6 +451,20 @@ class TestNoisyMeasurement:
     assert learner.steady_rls.theta[1] == pytest.approx(offset_before), "offset is untouched"
     assert not learner.model().diverged, "a reset column is no longer railed"
 
+  def test_a_railed_steer_ratio_resets_rather_than_persisting(self):
+    """Steer ratio is a separate fit (``sr_rls``) from the torque model, but the same
+    failure mode applies: a fit that has left the physically possible range must recover,
+    not be clipped and published as if it were a measurement forever."""
+    learner = self.feed(noise=0.0, one_signed=False)
+    before = learner.resets
+    learner.sr_rls.theta[0] = 50.0  # past STEER_RATIO_MAX_VALID
+    # one more accepted sample is enough: the check runs on every sr_rls update
+    learner.update(HondaSteerSample(t=1e6, v_ego=22.0, torque_cmd=0.1, steering_angle_deg=1.0,
+                                    steering_rate_deg=0.0, lat_active=True, lat_accel=0.2))
+    assert learner.resets == before + 1
+    assert learner.sr_rls.theta[0] == pytest.approx(learner.prior.steer_ratio)
+    assert learner.steer_ratio == pytest.approx(learner.prior.steer_ratio)
+
   def test_asymmetry_waits_for_both_directions(self):
     """max(u, 0) duplicates the command column while the command is one-signed."""
     one_way = self.feed(one_signed=True, seconds=120.0, flip=False)

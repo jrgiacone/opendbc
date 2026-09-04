@@ -101,6 +101,14 @@ OFFSET_MAX_VALID = 0.8
 ASYMMETRY_MIN_VALID = -0.8
 ASYMMETRY_MAX_VALID = 0.8
 
+# steer ratio is a separate sub-model (``sr_rls``) fit from an independent yaw source, not
+# from the torque model above, but the same failure mode applies: a fit that has left the
+# physically possible range should be flagged and recovered, not silently clipped to
+# [8, 25] and published as if it were a measurement. Wider than the publish clip for the
+# same reason as the terms above.
+STEER_RATIO_MIN_VALID = 6.0
+STEER_RATIO_MAX_VALID = 30.0
+
 # Asymmetry needs command in both directions to mean anything: with one-signed command,
 # max(u, 0) is either identical to u or identically zero, and the pair is unidentifiable.
 ASYM_MIN_CMD = 0.05
@@ -781,6 +789,11 @@ class HondaSteeringLearner:
       yaw = s.yaw_rate if s.yaw_rate is not None else lat_accel / max(s.v_ego, 1.0)
       x = np.array([yaw * self.wheelbase / max(s.v_ego, 1.0), lat_accel])
       self.sr_rls.update(x, math.radians(s.steering_angle_deg))
+      # a fit that has left the physically possible range is reset rather than clipped and
+      # published, the same treatment K_MIN_VALID/K_MAX_VALID gives the torque model's gain
+      if _railed(float(self.sr_rls.theta[0]), STEER_RATIO_MIN_VALID, STEER_RATIO_MAX_VALID):
+        self.sr_rls.reset(theta0=[self.prior.steer_ratio, self.prior.steer_ratio * 0.002])
+        self.resets += 1
       sr = float(np.clip(self.sr_rls.theta[0], 8.0, 25.0))
       self.steer_ratio = sr
       self.understeer_gradient = float(np.clip(self.sr_rls.theta[1] / max(sr, 1e-3), -0.05, 0.05))
@@ -935,8 +948,9 @@ class HondaSteeringLearner:
     # third of a 40 minute drive with ``diverged`` reporting False the whole time, because
     # only the gain fed it - this folds every clipped term into the same flag so that
     # cannot happen silently again. Steer ratio is a separate sub-model (``sr_rls``, not
-    # ``steady_rls``) with no prior validity gate of its own; giving it one is a separate
-    # change from surfacing what the torque model itself already had evidence for.
+    # ``steady_rls``) fit from an independent yaw source; it gets the equivalent protection
+    # where it is updated, resetting itself immediately rather than feeding this flag, so
+    # by the time ``model()`` reads it, it is never the thing that would make this true.
     clipped = (_railed(raw_friction, FRICTION_MIN_VALID, FRICTION_MAX_VALID)
                or _railed(raw_offset, OFFSET_MIN_VALID, OFFSET_MAX_VALID)
                or _railed(raw_asymmetry, ASYMMETRY_MIN_VALID, ASYMMETRY_MAX_VALID))
