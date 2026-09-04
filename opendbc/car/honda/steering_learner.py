@@ -58,9 +58,9 @@ MAX_LAT_JERK = 8.0             # m/s^3, reject transients we cannot model
 # keeps both well determined.
 STEADY_JERK = 0.5              # m/s^3, at or below this a sample is a steady state point
 DYNAMIC_JERK = 0.8             # m/s^3, above this a sample carries lag information
-JERK_WINDOW_S = 0.1            # s over which lateral acceleration is differentiated: long
-                               # enough that the difference is signal rather than noise,
-                               # short enough not to smear the lag it is used to measure
+# s over which lateral acceleration is differentiated: long enough that the difference is
+# signal rather than noise, short enough not to smear the lag it is used to measure
+JERK_WINDOW_S = 0.1
 RACK_MOTION_DEADBAND = 0.5     # deg/s over which the friction sign term ramps
 RACK_RATE_TAU = 0.2            # s, filter on rack speed before taking the friction sign
 MIN_SETTLE_TIME = 0.30         # s of continuously active, unsaturated control before use
@@ -179,11 +179,10 @@ DELAY_MIN_IMPROVEMENT = 0.05
 MAX_DELAY = 0.45               # s, Honda Bosch CAN FD racks are the slowest we have seen
 MIN_DELAY = 0.03
 DELAY_CANDIDATES = tuple(np.round(np.arange(MIN_DELAY, MAX_DELAY + 1e-9, 0.03), 3))
-DELAY_BANK_DECIMATION = 10     # only every Nth usable sample updates the bank: the bank
-                               # is by far the most expensive part of the learner, and the
-                               # dead time converges over minutes, not seconds
+# only every Nth usable sample updates the bank: the bank is by far the most expensive
+# part of the learner, and the dead time converges over minutes, not seconds
+DELAY_BANK_DECIMATION = 10
 DELAY_RESIDUAL_TAU = 2000.0    # samples of residual averaging per candidate
-
 
 
 def speed_bucket_centres() -> list[float]:
@@ -331,17 +330,17 @@ class HondaSteeringModel:
     return asdict(self)
 
   @staticmethod
-  def from_dict(d: dict) -> "HondaSteeringModel":
+  def from_dict(d: dict) -> HondaSteeringModel:
     if d.get("version") != MODEL_VERSION:
       raise ValueError(f"unsupported honda steering model version {d.get('version')}")
-    known = {f for f in HondaSteeringModel.__dataclass_fields__}
+    known = set(HondaSteeringModel.__dataclass_fields__)
     return HondaSteeringModel(**{k: v for k, v in d.items() if k in known})
 
   def to_json(self) -> str:
     return json.dumps(self.to_dict(), sort_keys=True)
 
   @staticmethod
-  def from_json(s: str | bytes) -> "HondaSteeringModel":
+  def from_json(s: str | bytes) -> HondaSteeringModel:
     return HondaSteeringModel.from_dict(json.loads(s))
 
 
@@ -357,20 +356,15 @@ def prior_from_car_params(CP) -> HondaSteeringModel:
   * the existing hand tune (``kpV``) is used as a weak sanity anchor,
   * the EPS generation flags set the delay prior.
   """
-  # FIXME: this reads an unpopulated torque scale as a real, very small one. The guard is
-  # on the list being empty, but HONDA_CLARITY carries torqueBP=[0], which is non-empty
-  # with a last element of zero, so it takes the branch and gets steer_max=0 rather than
-  # the 4096.0 default. max(steer_max, 1.0) below then floors scale_nudge at 0.8 and the
-  # Clarity ends up with the lowest gain prior in the fleet (1.520) despite being 276 kg
-  # lighter than the Pilot, which is what test_priors_differentiate_platforms is failing
-  # on. It is the only platform affected today, but any car whose lateralParams are not
-  # filled in inherits the same silently wrong prior rather than the default.
-  #
-  # Left alone deliberately: the fix changes what "missing" means for every platform's
-  # prior, and the priors want re-deriving against real routes anyway - route
-  # 729a2e65b1f6201d fits 2.49 against a 2.65 prior on a Civic, which is close, but one
-  # route is not evidence about the fleet. Revisit both together.
-  steer_max = float(CP.lateralParams.torqueBP[-1]) if len(CP.lateralParams.torqueBP) else 4096.0
+  # An unpopulated torque scale has to read as missing, not as a real but very small one.
+  # Guarding only on the list being empty is not enough: HONDA_CLARITY carries
+  # torqueBP=[0], non-empty with a last element of zero, so it took the branch and got
+  # steer_max=0. max(steer_max, 1.0) below then floored scale_nudge at 0.8 and gave the
+  # Clarity the lowest gain prior in the fleet (1.520) despite it being 276 kg lighter
+  # than the Pilot. Any platform whose lateralParams are not filled in inherits the same
+  # silently wrong prior, so the guard is on there being a positive scale to read.
+  torque_bp = CP.lateralParams.torqueBP
+  steer_max = float(torque_bp[-1]) if len(torque_bp) and torque_bp[-1] > 0 else 4096.0
   mass = float(CP.mass) or 1500.0
   fingerprint = str(CP.carFingerprint)
 
@@ -457,7 +451,7 @@ class _DelayBank:
 
   def __init__(self, theta0, p0, prior_delay: float, dt: float):
     self.dt = dt
-    self.candidates = [d for d in DELAY_CANDIDATES]
+    self.candidates = list(DELAY_CANDIDATES)
     self.rls = [_RLS(theta0, p0) for _ in self.candidates]
     self.residual = np.full(len(self.candidates), np.nan)
     self.n = 0
@@ -501,7 +495,7 @@ class _DelayBank:
     self.delay = self._interpolated()
 
   def _interpolated(self) -> float:
-    """Parabolic fit through the winning residual and its neighbours, for sub-grid resolution."""
+    """Parabolic fit through the winning residual and its neighbors, for sub-grid resolution."""
     i = self.best
     d = self.candidates[i]
     if 0 < i < len(self.candidates) - 1:
@@ -619,8 +613,8 @@ class HondaSteeringLearner:
     # from one point on the schedule would flatten it every ignition, throwing away the
     # speed dependence the schedule exists to capture.
     self.speed_rls = []
-    for centre in speed_bucket_centres():
-      k_i = max(seed.lat_accel_factor(centre), 1e-3)
+    for center in speed_bucket_centres():
+      k_i = max(seed.lat_accel_factor(center), 1e-3)
       self.speed_rls.append(_RLS([k_i, -k_i * seed.offset, -k_i * seed.friction,
                                   -k_i * seed.asymmetry],
                                  [0.5 * k_i ** 2, 0.05 * k_i ** 2, 0.02 * k_i ** 2,
@@ -758,7 +752,7 @@ class HondaSteeringLearner:
 
   # -- main ---------------------------------------------------------------------------
   def update(self, s: HondaSteerSample) -> None:
-    last, self._last = self._last, s
+    self._last = s
 
     if not s.lat_active or s.steering_pressed:
       self._active_for = 0.0
@@ -995,14 +989,14 @@ class HondaSteeringLearner:
     # range, otherwise fall back to the global fit so the schedule stays monotonic-ish
     bps, vs, learned_buckets = [], [], 0
     prior_gain = self.prior.lat_accel_factor(20.0)
-    for i, centre in enumerate(speed_bucket_centres()):
+    for i, center in enumerate(speed_bucket_centres()):
       bucket = self._bucket_gain(i)
       if bucket is not None:
         vs.append(bucket)
         learned_buckets += 1
       else:
         vs.append(k if k is not None else prior_gain)
-      bps.append(centre)
+      bps.append(center)
     m.lat_accel_factor_bp = bps
     m.lat_accel_factor_v = vs
     m.learned_buckets = learned_buckets
@@ -1039,7 +1033,7 @@ class HondaSteeringLearner:
     """Whether the covered cells span enough lateral acceleration to fit anything.
 
     Point count is not coverage. Route 729a2e65b1f6201d had 1150 points in one cell and
-    100 in its neighbour, which passed a count test easily and still described a band far
+    100 in its neighbor, which passed a count test easily and still described a band far
     too narrow to separate gain from offset once measurement noise is accounted for.
     """
     covered = np.where(np.asarray(cells) >= MIN_POINTS_PER_BUCKET)[0]
