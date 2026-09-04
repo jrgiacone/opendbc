@@ -435,6 +435,22 @@ class TestNoisyMeasurement:
     assert learner.resets == before + 1
     assert learner.steady_rls.theta[0] == pytest.approx(learner.prior.lat_accel_factor(20.0))
 
+  def test_a_railed_secondary_term_resets_only_itself(self):
+    """A friction/offset/asymmetry divergence must recover, not stay flagged forever - and
+    must not throw away a gain, or the other two terms, that are still sound."""
+    learner = self.feed(noise=0.0, one_signed=False)
+    k_before = learner.steady_rls.theta[0]
+    offset_before = learner.steady_rls.theta[1]
+    before = learner.resets
+    # push only the asymmetry term past ASYMMETRY_MAX_VALID
+    learner.steady_rls.theta[3] = -10.0 * k_before
+    learner._check_divergence()
+    assert learner.resets == before + 1
+    assert learner.steady_rls.theta[3] == 0.0, "the railed column resets to nothing measured"
+    assert learner.steady_rls.theta[0] == pytest.approx(k_before), "gain is untouched"
+    assert learner.steady_rls.theta[1] == pytest.approx(offset_before), "offset is untouched"
+    assert not learner.model().diverged, "a reset column is no longer railed"
+
   def test_asymmetry_waits_for_both_directions(self):
     """max(u, 0) duplicates the command column while the command is one-signed."""
     one_way = self.feed(one_signed=True, seconds=120.0, flip=False)

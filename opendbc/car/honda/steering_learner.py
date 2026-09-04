@@ -862,17 +862,46 @@ class HondaSteeringLearner:
         rls.P[:, 3] = 0.0
         rls.P[3, 3] = rls.p0[3]
 
+  @staticmethod
+  def _reset_railed_term(rls: _RLS, i: int, lo: float, hi: float) -> bool:
+    """Reset one secondary term's column if it has left its divergence range.
+
+    Only the offending column is zeroed - the gain and the other two terms sharing this
+    fit are still evidence worth keeping, the same reasoning ``_note_asymmetry_excitation``
+    already uses when it turns the asymmetry column on. Without this, a term flagged by
+    ``model().diverged`` for being outside its ``*_MIN_VALID``/``*_MAX_VALID`` range has no
+    way back: nothing else in the fit moves that column, so it would stay diverged for the
+    rest of the drive once it left range.
+    """
+    raw = -rls.theta[i] / rls.theta[0]
+    if not _railed(raw, lo, hi):
+      return False
+    rls.theta[i] = 0.0
+    rls.P[i, :] = 0.0
+    rls.P[:, i] = 0.0
+    rls.P[i, i] = rls.p0[i]
+    return True
+
   def _check_divergence(self) -> None:
     """A fit that has left the physically possible range is reset, not published.
 
-    Once the gain is wrong every later sample is interpreted through it, so a diverged
-    fit does not recover on its own. Resetting costs the drive's learning; leaving it
-    costs a model that looks plausible and is not.
+    Once a term is wrong every later sample is interpreted through it, so a diverged fit
+    does not recover on its own. Resetting costs the drive's learning; leaving it costs a
+    model that looks plausible and is not. The gain gets a full reset - every other term
+    is defined relative to it, so a wrong gain poisons all of them - while friction, offset
+    and asymmetry each get their own column reset, since a divergence isolated to one of
+    them should not discard the other two along with a gain that is still sound.
     """
     for rls in [self.steady_rls] + self.speed_rls:
       if not (K_MIN_VALID <= rls.theta[0] <= K_MAX_VALID) or not np.isfinite(rls.theta).all():
         rls.reset(theta0=[self.prior.lat_accel_factor(20.0), 0.0, 0.0, 0.0])
         self.resets += 1
+        continue
+      for i, lo, hi in ((1, OFFSET_MIN_VALID, OFFSET_MAX_VALID),
+                        (2, FRICTION_MIN_VALID, FRICTION_MAX_VALID),
+                        (3, ASYMMETRY_MIN_VALID, ASYMMETRY_MAX_VALID)):
+        if self._reset_railed_term(rls, i, lo, hi):
+          self.resets += 1
 
   # -- output -------------------------------------------------------------------------
   def _factor_from(self, rls: _RLS) -> float | None:
