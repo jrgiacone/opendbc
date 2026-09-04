@@ -88,6 +88,19 @@ RESTART_COVARIANCE_INFLATION = 2.0
 K_MIN_VALID = 0.2
 K_MAX_VALID = 8.0
 
+# friction, offset and asymmetry are clipped to their physical range before publishing
+# (see ``model()``), but a fit that merely brushes that boundary under ordinary sample
+# noise is not the same failure as one that has actually left the physically possible
+# range - the gain gets that same slack, via K_MIN_VALID/K_MAX_VALID being wider than the
+# range priors are drawn from. These bounds are wider than the publish clip for the same
+# reason, and only a fit past them counts as diverged for ``model().diverged``.
+FRICTION_MIN_VALID = -0.3
+FRICTION_MAX_VALID = 0.7
+OFFSET_MIN_VALID = -0.8
+OFFSET_MAX_VALID = 0.8
+ASYMMETRY_MIN_VALID = -0.8
+ASYMMETRY_MAX_VALID = 0.8
+
 # Asymmetry needs command in both directions to mean anything: with one-signed command,
 # max(u, 0) is either identical to u or identically zero, and the pair is unidentifiable.
 ASYM_MIN_CMD = 0.05
@@ -186,6 +199,17 @@ def _smooth_sign(x: float, width: float) -> float:
   if width <= 0.0:
     return float(np.sign(x))
   return float(np.clip(x / width, -1.0, 1.0))
+
+
+def _railed(value: float, lo: float, hi: float) -> bool:
+  """Whether a value sits outside the range it gets clipped to before publishing.
+
+  A term that would be clipped is not a measurement of the clipped bound, it is a fit
+  that left the physically possible range with the evidence discarded on the way out.
+  The gain already gets this treatment via ``K_MIN_VALID``/``K_MAX_VALID``; this is the
+  same check for every other term ``model()`` clips.
+  """
+  return not np.isfinite(value) or value < lo or value > hi
 
 
 @dataclass
@@ -869,13 +893,29 @@ class HondaSteeringLearner:
     # back out by the gain that scaled it
     k = self._factor_from(self.steady_rls)
     scale = k if k is not None else self.prior.lat_accel_factor(20.0)
+    raw_friction = -self.steady_rls.theta[2] / scale
+    # wider than it was: a skipped roll compensation leaves its crown here, and the
+    # old +-0.3 was already railing on route 729a2e65b1f6201d with the compensation on
+    raw_offset = -self.steady_rls.theta[1] / scale
+    raw_asymmetry = -self.steady_rls.theta[3] / scale
+    # A term that has left its *_MIN_VALID/*_MAX_VALID range is the same failure mode as a
+    # gain outside [K_MIN_VALID, K_MAX_VALID]: a fit that left the physically possible
+    # range with the evidence discarded on the way out, rather than one merely brushing
+    # the tighter publish-clip boundary under ordinary sample noise. Route
+    # 729a2e65b1f6201d/00000011 published asymmetry pinned at the +0.5 rail for the back
+    # third of a 40 minute drive with ``diverged`` reporting False the whole time, because
+    # only the gain fed it - this folds every clipped term into the same flag so that
+    # cannot happen silently again. Steer ratio is a separate sub-model (``sr_rls``, not
+    # ``steady_rls``) with no prior validity gate of its own; giving it one is a separate
+    # change from surfacing what the torque model itself already had evidence for.
+    clipped = (_railed(raw_friction, FRICTION_MIN_VALID, FRICTION_MAX_VALID)
+               or _railed(raw_offset, OFFSET_MIN_VALID, OFFSET_MAX_VALID)
+               or _railed(raw_asymmetry, ASYMMETRY_MIN_VALID, ASYMMETRY_MAX_VALID))
     m = HondaSteeringModel(
       fingerprint=self.fingerprint,
-      friction=float(np.clip(-self.steady_rls.theta[2] / scale, 0.0, 0.4)),
-      # wider than it was: a skipped roll compensation leaves its crown here, and the
-      # old +-0.3 was already railing on route 729a2e65b1f6201d with the compensation on
-      offset=float(np.clip(-self.steady_rls.theta[1] / scale, -0.5, 0.5)),
-      asymmetry=float(np.clip(-self.steady_rls.theta[3] / scale, -0.5, 0.5)),
+      friction=float(np.clip(raw_friction, 0.0, 0.4)),
+      offset=float(np.clip(raw_offset, -0.5, 0.5)),
+      asymmetry=float(np.clip(raw_asymmetry, -0.5, 0.5)),
       response_tau=float(np.clip(-self.lag_rls.theta[0], 0.0, 0.6)),
       actuator_delay=self.delay_bank.delay,
       delay_learned=self.delay_bank.learned,
@@ -885,7 +925,7 @@ class HondaSteeringLearner:
       driver_torque_threshold=self.override_est.threshold,
       points=self.points,
       resets=self.resets,
-      diverged=k is None,
+      diverged=k is None or clipped,
       asymmetry_learned=self._asym_enabled,
       roll_comp_fraction=self._roll_comp_fraction(),
       lat_accel_torque_corr=self.corr_compensated.value,
@@ -917,7 +957,7 @@ class HondaSteeringLearner:
       "lag": self.lag_rls.P.tolist(),
     }
 
-    m.valid = (k is not None and self.points >= MIN_TOTAL_POINTS and learned_buckets >= 1
+    m.valid = (not m.diverged and self.points >= MIN_TOTAL_POINTS and learned_buckets >= 1
                and self._excited(self.bucket_counts.sum(axis=0)))
     return m
 

@@ -395,6 +395,38 @@ class TestNoisyMeasurement:
     # with nothing measured, the published gain is the prior - but flagged, not silent
     assert m.lat_accel_factor(22.0) == pytest.approx(learner.prior.lat_accel_factor(22.0))
 
+  def test_a_railed_secondary_term_is_surfaced_not_masked(self):
+    """friction/offset/asymmetry are clipped before publishing same as the gain is - a fit
+    that has genuinely left the physically possible range is a diverged fit too, even with
+    the gain itself still in range.
+
+    Route 729a2e65b1f6201d/00000011 published asymmetry pinned at the +0.5 publish-clip
+    rail for the back third of a 40 minute drive with ``diverged`` reporting False
+    throughout, because only the gain fed it.
+    """
+    learner = self.feed(noise=0.0, one_signed=False)
+    assert learner.model().valid
+    assert not learner.model().diverged
+    # push the asymmetry term well past ASYMMETRY_MAX_VALID; gain is untouched
+    learner.steady_rls.theta[3] = -10.0 * learner.steady_rls.theta[0]
+    m = learner.model()
+    assert m.asymmetry == pytest.approx(0.5), "still clipped for publishing"
+    assert m.diverged, "a fit railed past ASYMMETRY_MAX_VALID must be flagged, not silently clipped"
+    assert not m.valid, "a diverged fit must never be published as converged"
+
+  def test_ordinary_fit_noise_does_not_trip_divergence(self):
+    """A term merely brushing its publish-clip boundary is not the same as one that has
+    left the physically possible range - only the wider *_MIN_VALID/*_MAX_VALID bounds
+    (mirroring K_MIN_VALID/K_MAX_VALID) should mark a fit diverged."""
+    learner = self.feed(noise=0.0, one_signed=False)
+    m = learner.model()
+    assert not m.diverged
+    # sits right at the publish-clip edge, well inside FRICTION_MIN_VALID/MAX_VALID
+    learner.steady_rls.theta[2] = -0.45 * learner.steady_rls.theta[0]
+    m = learner.model()
+    assert m.friction == pytest.approx(0.4)
+    assert not m.diverged, "brushing the publish-clip bound alone must not read as diverged"
+
   def test_divergence_resets_rather_than_persisting(self):
     learner = self.feed(noise=0.0, one_signed=False)
     before = learner.resets
