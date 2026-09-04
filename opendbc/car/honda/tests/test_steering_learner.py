@@ -1,7 +1,7 @@
 import math
+import unittest
 
 import numpy as np
-import pytest
 
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.lat_controller import HondaAdaptiveLatController
@@ -22,6 +22,35 @@ from opendbc.car.honda.values import CAR
 # covers the rate Honda control actually runs at.
 DT = 0.02
 ALL_CARS = list(CAR)
+
+
+class approx:
+  """Tolerant float (or float sequence) comparison, for `assert x == approx(y)`.
+
+  Lowercase deliberately: it reads as a value at the call site, not as a class.
+
+  opendbc runs its tests under ``unittest-parallel`` and has no pytest dependency, so
+  ``pytest.approx`` is not available here. This covers the part of its behaviour these
+  tests use: the same default tolerances (rel=1e-6, abs=1e-12), an ``abs``-only mode, and
+  element-wise comparison of a sequence.
+  """
+
+  def __init__(self, expected, rel=1e-6, abs=1e-12):  # noqa: A002 - mirrors pytest.approx
+    self.expected = expected
+    self.rel = rel
+    self.abs = abs
+
+  def _close(self, actual, expected):
+    return abs(actual - expected) <= max(self.rel * abs(expected), self.abs)
+
+  def __eq__(self, actual):
+    if isinstance(self.expected, list | tuple):
+      return (len(actual) == len(self.expected)
+              and all(self._close(a, e) for a, e in zip(actual, self.expected, strict=True)))
+    return self._close(actual, self.expected)
+
+  def __repr__(self):
+    return f"approx({self.expected!r}, rel={self.rel}, abs={self.abs})"
 
 
 def drive(CP, truth, seconds=250.0, learned=None, v_profile=None, amplitude_scale=1.0, dt=None):
@@ -56,196 +85,195 @@ def drive(CP, truth, seconds=250.0, learned=None, v_profile=None, amplitude_scal
   return ctrl, plant
 
 
-@pytest.mark.parametrize("car", ALL_CARS)
-def test_prior_is_sane_for_every_platform(car):
-  """Every Honda gets a distinct, bounded prior straight from its own CarParams."""
-  CP = CarInterface.get_non_essential_params(car)
-  prior = prior_from_car_params(CP)
-  assert prior.fingerprint == str(car)
-  assert 0.6 <= prior.lat_accel_factor(20.0) <= 6.0
-  assert 0.03 <= prior.actuator_delay <= 0.45
-  assert prior.steer_ratio == pytest.approx(CP.steerRatio)
-  assert not prior.valid
+class TestFleet(unittest.TestCase):
+  """The whole Honda/Acura fleet, swept platform by platform."""
+
+  def test_prior_is_sane_for_every_platform(self):
+    """Every Honda gets a distinct, bounded prior straight from its own CarParams."""
+    for car in ALL_CARS:
+      with self.subTest(car=car):
+        CP = CarInterface.get_non_essential_params(car)
+        prior = prior_from_car_params(CP)
+        assert prior.fingerprint == str(car)
+        assert 0.6 <= prior.lat_accel_factor(20.0) <= 6.0
+        assert 0.03 <= prior.actuator_delay <= 0.45
+        assert prior.steer_ratio == approx(CP.steerRatio)
+        assert not prior.valid
+
+  def test_priors_differentiate_platforms(self):
+    """The prior must actually separate the fleet, not collapse to one number."""
+    factors = {c: prior_from_car_params(CarInterface.get_non_essential_params(c)).lat_accel_factor(20.)
+               for c in ALL_CARS}
+    assert len(set(round(f, 3) for f in factors.values())) > len(ALL_CARS) // 2
+    # the lightest car in the fleet should need the least torque per m/s^2, the heaviest
+    # the most
+    specs = {c: CarInterface.get_non_essential_params(c).mass for c in ALL_CARS}
+    heaviest = sorted(specs, key=specs.get)[-3:]
+    assert max(factors, key=factors.get) == min(specs, key=specs.get)
+    assert min(factors, key=factors.get) in heaviest
+
+  def test_learns_gain_and_friction(self):
+    """The learner recovers each car's true EPS gain from a plant it was not primed on."""
+    for car in ALL_CARS:
+      with self.subTest(car=car):
+        CP = CarInterface.get_non_essential_params(car)
+        truth = HondaPlantTruth.for_car(CP)
+        ctrl, _ = drive(CP, truth)
+        m = ctrl.learner.model()
+
+        assert m.valid, f"{car}: never converged ({m.points} points)"
+        assert m.points > 1000
+        learned = m.lat_accel_factor(20.0)
+        assert learned == approx(truth.lat_accel_factor, rel=0.20), \
+          f"{car}: learned {learned:.3f} vs truth {truth.lat_accel_factor:.3f}"
+        assert abs(m.friction - truth.friction) < 0.05
+        assert abs(m.offset - truth.offset) < 0.04
+
+  def test_learned_beats_prior(self):
+    """Learning must improve tracking, not just produce numbers.
+
+    A prior drawn close to the truth cannot be beaten, so the bar depends on how wrong the
+    prior actually is for this car: pay for itself where the prior is off, do no harm where
+    it is not.
+    """
+    for car in ALL_CARS[::7]:
+      with self.subTest(car=car):
+        CP = CarInterface.get_non_essential_params(car)
+        truth = HondaPlantTruth.for_car(CP)
+        trained, _ = drive(CP, truth)
+        learned = trained.learner.model()
+        assert learned.valid
+
+        def rms(model, CP=CP, truth=truth):
+          ctrl = HondaAdaptiveLatController(CP, dt=DT, learned=model)
+          plant = HondaPlant(truth, DT)
+          errs = []
+          for i in range(int(120.0 / DT)):
+            t = i * DT
+            v = 22.0
+            desired = 1.5 * math.sin(2 * math.pi * t / 9.0)
+            jerk = 1.5 * 2 * math.pi / 9.0 * math.cos(2 * math.pi * t / 9.0)
+            torque, _ = ctrl.update(desired, plant.lat_accel, v, plant.angle_deg, plant.rate_deg,
+                                    lat_active=True, desired_lat_jerk=jerk)
+            plant.step(torque, v)
+            if t > 20.0:
+              errs.append(desired - plant.lat_accel)
+          return float(np.sqrt(np.mean(np.square(errs))))
+
+        learned_rms, prior_rms = rms(learned), rms(None)
+        prior_error = abs(trained.prior.lat_accel_factor(22.0) / truth.lat_accel_factor - 1.0)
+        if prior_error > 0.15:
+          # the prior is materially wrong about this car, so measuring must pay for itself
+          assert learned_rms < prior_rms * 0.95, f"{car}: {learned_rms:.4f} vs prior {prior_rms:.4f}"
+        else:
+          # the prior happens to be nearly right; learning must at least not undo that
+          assert learned_rms < prior_rms * 1.25, f"{car}: {learned_rms:.4f} vs prior {prior_rms:.4f}"
+
+  def test_learns_command_to_motion_lag(self):
+    """Dead time plus rack time constant, the quantity control actually cares about.
+
+    The split between the two is only weakly observable from smooth steering, so the model
+    documents and this test checks their sum.
+    """
+    for car in ALL_CARS[::5]:
+      with self.subTest(car=car):
+        CP = CarInterface.get_non_essential_params(car)
+        truth = HondaPlantTruth.for_car(CP)
+        ctrl, _ = drive(CP, truth)
+        m = ctrl.learner.model()
+        assert abs(m.effective_lag - (truth.delay + truth.tau)) < 0.10, \
+          f"{car}: learned lag {m.effective_lag:.3f} vs truth {truth.delay + truth.tau:.3f}"
+        assert MIN_DELAY <= m.actuator_delay <= MAX_DELAY
+
+  def test_output_always_bounded(self):
+    """Whatever the model says, the command stays inside the platform's torque range."""
+    for car in ALL_CARS[::4]:
+      with self.subTest(car=car):
+        CP = CarInterface.get_non_essential_params(car)
+        ctrl = HondaAdaptiveLatController(CP, dt=DT)
+        for i in range(2000):
+          out, _ = ctrl.update(50.0 * (-1) ** i, -50.0 * (-1) ** i, 30.0, 0.0, 0.0, lat_active=True)
+          assert -1.0 <= out <= 1.0
+        assert abs(ctrl.i) <= 0.36
 
 
-def test_priors_differentiate_platforms():
-  """The prior must actually separate the fleet, not collapse to one number."""
-  factors = {c: prior_from_car_params(CarInterface.get_non_essential_params(c)).lat_accel_factor(20.)
-             for c in ALL_CARS}
-  assert len(set(round(f, 3) for f in factors.values())) > len(ALL_CARS) // 2
-  # the lightest car in the fleet should need the least torque per m/s^2, the heaviest
-  # the most
-  specs = {c: CarInterface.get_non_essential_params(c).mass for c in ALL_CARS}
-  heaviest = sorted(specs, key=specs.get)[-3:]
-  assert max(factors, key=factors.get) == min(specs, key=specs.get)
-  assert min(factors, key=factors.get) in heaviest
+class TestLearning(unittest.TestCase):
+  def test_learns_at_100hz(self):
+    """The rate Honda control actually runs at, on a car whose prior is well off."""
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+    truth = HondaPlantTruth.for_car(CP)
+    ctrl, _ = drive(CP, truth, seconds=250.0, dt=0.01)
+    m = ctrl.learner.model()
+    assert m.valid
+    assert m.lat_accel_factor(20.0) == approx(truth.lat_accel_factor, rel=0.20)
+    assert abs(m.effective_lag - (truth.delay + truth.tau)) < 0.10
 
+  def test_learns_speed_schedule(self):
+    """A car whose gain varies with speed gets a schedule, not one number."""
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_BOSCH)
+    truth = HondaPlantTruth.for_car(CP)
 
-@pytest.mark.parametrize("car", ALL_CARS)
-def test_learns_gain_and_friction(car):
-  """The learner recovers each car's true EPS gain from a plant it was not primed on."""
-  CP = CarInterface.get_non_essential_params(car)
-  truth = HondaPlantTruth.for_car(CP)
-  ctrl, _ = drive(CP, truth)
-  m = ctrl.learner.model()
-
-  assert m.valid, f"{car}: never converged ({m.points} points)"
-  assert m.points > 1000
-  learned = m.lat_accel_factor(20.0)
-  assert learned == pytest.approx(truth.lat_accel_factor, rel=0.20), \
-    f"{car}: learned {learned:.3f} vs truth {truth.lat_accel_factor:.3f}"
-  assert abs(m.friction - truth.friction) < 0.05
-  assert abs(m.offset - truth.offset) < 0.04
-
-
-@pytest.mark.parametrize("car", ALL_CARS[::7])
-def test_learned_beats_prior(car):
-  """Learning must improve tracking, not just produce numbers.
-
-  A prior drawn close to the truth cannot be beaten, so the bar depends on how wrong the
-  prior actually is for this car: pay for itself where the prior is off, do no harm where
-  it is not.
-  """
-  CP = CarInterface.get_non_essential_params(car)
-  truth = HondaPlantTruth.for_car(CP)
-  trained, _ = drive(CP, truth)
-  learned = trained.learner.model()
-  assert learned.valid
-
-  def rms(model):
-    ctrl = HondaAdaptiveLatController(CP, dt=DT, learned=model)
-    plant = HondaPlant(truth, DT)
-    errs = []
-    for i in range(int(120.0 / DT)):
+    learner = HondaSteeringLearner(CP, dt=DT)
+    rng = np.random.default_rng(1)
+    for i in range(int(1200.0 / DT)):
       t = i * DT
-      v = 22.0
-      desired = 1.5 * math.sin(2 * math.pi * t / 9.0)
-      jerk = 1.5 * 2 * math.pi / 9.0 * math.cos(2 * math.pi * t / 9.0)
-      torque, _ = ctrl.update(desired, plant.lat_accel, v, plant.angle_deg, plant.rate_deg,
-                              lat_active=True, desired_lat_jerk=jerk)
-      plant.step(torque, v)
-      if t > 20.0:
-        errs.append(desired - plant.lat_accel)
-    return float(np.sqrt(np.mean(np.square(errs))))
+      v = 10.0 + 20.0 * (i % 30000) / 30000.0
+      # true gain falls off with speed, as Honda EPS assist does
+      k = truth.lat_accel_factor * (1.0 - 0.010 * (v - 10.0))
+      a = 1.5 * math.sin(2 * math.pi * t / 8.0) + 0.4 * rng.normal()
+      u = a / k + truth.offset
+      learner.update(HondaSteerSample(t=t, v_ego=v, torque_cmd=u, steering_angle_deg=0.0,
+                                      steering_rate_deg=math.degrees(a), lat_active=True,
+                                      lat_accel=a))
+    m = learner.model()
+    assert m.valid and m.learned_buckets >= 2
+    assert m.lat_accel_factor(10.0) > m.lat_accel_factor(30.0) * 1.05
 
-  learned_rms, prior_rms = rms(learned), rms(None)
-  prior_error = abs(trained.prior.lat_accel_factor(22.0) / truth.lat_accel_factor - 1.0)
-  if prior_error > 0.15:
-    # the prior is materially wrong about this car, so measuring must pay for itself
-    assert learned_rms < prior_rms * 0.95, f"{car}: {learned_rms:.4f} vs prior {prior_rms:.4f}"
-  else:
-    # the prior happens to be nearly right; learning must at least not undo that
-    assert learned_rms < prior_rms * 1.25, f"{car}: {learned_rms:.4f} vs prior {prior_rms:.4f}"
+  def test_learns_driver_override_threshold(self):
+    CP = CarInterface.get_non_essential_params(CAR.ACURA_RDX)
+    learner = HondaSteeringLearner(CP, dt=DT)
+    rng = np.random.default_rng(2)
+    for i in range(20000):
+      learner.update(HondaSteerSample(t=i * DT, v_ego=25.0, torque_cmd=0.0,
+                                      steering_angle_deg=0.0, steering_rate_deg=0.0,
+                                      driver_torque=rng.normal(0.0, 40.0), lat_active=True,
+                                      lat_accel=0.0))
+    th = learner.model().driver_torque_threshold
+    assert 300.0 <= th <= 700.0, th
 
+  def test_saturated_commands_are_not_learned_from(self):
+    """A rack that gives up at 70% of STEER_MAX must not drag the gain estimate with it."""
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_PILOT)
+    truth = HondaPlantTruth.for_car(CP)
+    truth.max_torque = 0.70
+    # demand far more than the rack can give, so the saturated region is actually visited
+    ctrl, _ = drive(CP, truth, seconds=500.0, amplitude_scale=2.5)
+    m = ctrl.learner.model()
+    assert m.valid
+    assert m.lat_accel_factor(20.0) == approx(truth.lat_accel_factor, rel=0.25)
 
-@pytest.mark.parametrize("car", ALL_CARS[::5])
-def test_learns_command_to_motion_lag(car):
-  """Dead time plus rack time constant, the quantity control actually cares about.
+  def test_no_learning_while_disengaged_or_overridden(self):
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_ACCORD)
+    learner = HondaSteeringLearner(CP, dt=DT)
+    for i in range(5000):
+      learner.update(HondaSteerSample(t=i * DT, v_ego=25.0, torque_cmd=0.5,
+                                      steering_angle_deg=5.0, steering_rate_deg=1.0,
+                                      lat_active=False, lat_accel=1.0))
+      learner.update(HondaSteerSample(t=i * DT, v_ego=25.0, torque_cmd=0.5,
+                                      steering_angle_deg=5.0, steering_rate_deg=1.0,
+                                      lat_active=True, steering_pressed=True, lat_accel=1.0))
+    assert learner.points == 0
+    assert not learner.model().valid
 
-  The split between the two is only weakly observable from smooth steering, so the model
-  documents and this test checks their sum.
-  """
-  CP = CarInterface.get_non_essential_params(car)
-  truth = HondaPlantTruth.for_car(CP)
-  ctrl, _ = drive(CP, truth)
-  m = ctrl.learner.model()
-  assert abs(m.effective_lag - (truth.delay + truth.tau)) < 0.10, \
-    f"{car}: learned lag {m.effective_lag:.3f} vs truth {truth.delay + truth.tau:.3f}"
-  assert MIN_DELAY <= m.actuator_delay <= MAX_DELAY
-
-
-def test_learns_at_100hz():
-  """The rate Honda control actually runs at, on a car whose prior is well off."""
-  CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
-  truth = HondaPlantTruth.for_car(CP)
-  ctrl, _ = drive(CP, truth, seconds=250.0, dt=0.01)
-  m = ctrl.learner.model()
-  assert m.valid
-  assert m.lat_accel_factor(20.0) == pytest.approx(truth.lat_accel_factor, rel=0.20)
-  assert abs(m.effective_lag - (truth.delay + truth.tau)) < 0.10
-
-
-def test_learns_speed_schedule():
-  """A car whose gain varies with speed gets a schedule, not one number."""
-  CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_BOSCH)
-  truth = HondaPlantTruth.for_car(CP)
-
-  learner = HondaSteeringLearner(CP, dt=DT)
-  rng = np.random.default_rng(1)
-  for i in range(int(1200.0 / DT)):
-    t = i * DT
-    v = 10.0 + 20.0 * (i % 30000) / 30000.0
-    # true gain falls off with speed, as Honda EPS assist does
-    k = truth.lat_accel_factor * (1.0 - 0.010 * (v - 10.0))
-    a = 1.5 * math.sin(2 * math.pi * t / 8.0) + 0.4 * rng.normal()
-    u = a / k + truth.offset
-    learner.update(HondaSteerSample(t=t, v_ego=v, torque_cmd=u, steering_angle_deg=0.0,
-                                    steering_rate_deg=math.degrees(a), lat_active=True,
-                                    lat_accel=a))
-  m = learner.model()
-  assert m.valid and m.learned_buckets >= 2
-  assert m.lat_accel_factor(10.0) > m.lat_accel_factor(30.0) * 1.05
+  def test_controller_is_inert_and_safe_when_inactive(self):
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CRV_5G)
+    ctrl = HondaAdaptiveLatController(CP, dt=DT)
+    for _ in range(100):
+      out, _dbg = ctrl.update(2.0, 0.0, 25.0, 0.0, 0.0, lat_active=False)
+      assert out == 0.0 and ctrl.i == 0.0
 
 
-def test_learns_driver_override_threshold():
-  CP = CarInterface.get_non_essential_params(CAR.ACURA_RDX)
-  learner = HondaSteeringLearner(CP, dt=DT)
-  rng = np.random.default_rng(2)
-  for i in range(20000):
-    learner.update(HondaSteerSample(t=i * DT, v_ego=25.0, torque_cmd=0.0,
-                                    steering_angle_deg=0.0, steering_rate_deg=0.0,
-                                    driver_torque=rng.normal(0.0, 40.0), lat_active=True,
-                                    lat_accel=0.0))
-  th = learner.model().driver_torque_threshold
-  assert 300.0 <= th <= 700.0, th
-
-
-def test_saturated_commands_are_not_learned_from():
-  """A rack that gives up at 70% of STEER_MAX must not drag the gain estimate with it."""
-  CP = CarInterface.get_non_essential_params(CAR.HONDA_PILOT)
-  truth = HondaPlantTruth.for_car(CP)
-  truth.max_torque = 0.70
-  # demand far more than the rack can give, so the saturated region is actually visited
-  ctrl, _ = drive(CP, truth, seconds=500.0, amplitude_scale=2.5)
-  m = ctrl.learner.model()
-  assert m.valid
-  assert m.lat_accel_factor(20.0) == pytest.approx(truth.lat_accel_factor, rel=0.25)
-
-
-def test_no_learning_while_disengaged_or_overridden():
-  CP = CarInterface.get_non_essential_params(CAR.HONDA_ACCORD)
-  learner = HondaSteeringLearner(CP, dt=DT)
-  for i in range(5000):
-    learner.update(HondaSteerSample(t=i * DT, v_ego=25.0, torque_cmd=0.5,
-                                    steering_angle_deg=5.0, steering_rate_deg=1.0,
-                                    lat_active=False, lat_accel=1.0))
-    learner.update(HondaSteerSample(t=i * DT, v_ego=25.0, torque_cmd=0.5,
-                                    steering_angle_deg=5.0, steering_rate_deg=1.0,
-                                    lat_active=True, steering_pressed=True, lat_accel=1.0))
-  assert learner.points == 0
-  assert not learner.model().valid
-
-
-def test_controller_is_inert_and_safe_when_inactive():
-  CP = CarInterface.get_non_essential_params(CAR.HONDA_CRV_5G)
-  ctrl = HondaAdaptiveLatController(CP, dt=DT)
-  for _ in range(100):
-    out, dbg = ctrl.update(2.0, 0.0, 25.0, 0.0, 0.0, lat_active=False)
-    assert out == 0.0 and ctrl.i == 0.0
-
-
-@pytest.mark.parametrize("car", ALL_CARS[::4])
-def test_output_always_bounded(car):
-  """Whatever the model says, the command stays inside the platform's torque range."""
-  CP = CarInterface.get_non_essential_params(car)
-  ctrl = HondaAdaptiveLatController(CP, dt=DT)
-  for i in range(2000):
-    out, _ = ctrl.update(50.0 * (-1) ** i, -50.0 * (-1) ** i, 30.0, 0.0, 0.0, lat_active=True)
-    assert -1.0 <= out <= 1.0
-  assert abs(ctrl.i) <= 0.36
-
-
-class TestResume:
+class TestResume(unittest.TestCase):
   """A restart must continue a model, not merely copy its numbers."""
 
   @staticmethod
@@ -276,7 +304,7 @@ class TestResume:
     assert spread > 0.1, before.lat_accel_factor_v
 
     after = HondaSteeringLearner(CP, dt=DT, learned=before).model()
-    assert after.lat_accel_factor_v == pytest.approx(before.lat_accel_factor_v, rel=0.02)
+    assert after.lat_accel_factor_v == approx(before.lat_accel_factor_v, rel=0.02)
     assert after.learned_buckets == before.learned_buckets
 
   def test_keeps_confidence(self):
@@ -286,7 +314,7 @@ class TestResume:
     fresh = HondaSteeringLearner(CP, dt=DT)
 
     trained_var = model.covariance["steady"][0][0]
-    assert resumed.steady_rls.P[0][0] == pytest.approx(trained_var * 2.0)
+    assert resumed.steady_rls.P[0][0] == approx(trained_var * 2.0)
     assert resumed.steady_rls.P[0][0] < fresh.steady_rls.P[0][0]
 
   def test_keeps_lifetime_points_and_stays_converged(self):
@@ -309,38 +337,39 @@ class TestResume:
       plant.step(torque, 24.0)
     second = ctrl.learner.model()
     assert second.points > first.points
-    assert second.lat_accel_factor(20.0) == pytest.approx(truth.lat_accel_factor, rel=0.20)
+    assert second.lat_accel_factor(20.0) == approx(truth.lat_accel_factor, rel=0.20)
 
   def test_resumes_the_delay_rather_than_re_racing_it(self):
     CP, _, model = self.trained()
     resumed = HondaSteeringLearner(CP, dt=DT, learned=model)
-    assert resumed.model().actuator_delay == pytest.approx(model.actuator_delay)
+    assert resumed.model().actuator_delay == approx(model.actuator_delay)
 
-  @pytest.mark.parametrize("damage", [
-    {"bucket_counts": [[1, 2], [3, 4]]},
-    {"bucket_counts": "not a list"},
-    {"covariance": {"steady": [[1.0]]}},
-    {"covariance": {"steady": "nope"}},
-    {"covariance": {"steady": [[float("nan")] * 4] * 4}},
-    {"bucket_counts": [], "covariance": {}},
-  ])
-  def test_ignores_a_misshapen_cache(self, damage):
+  def test_ignores_a_misshapen_cache(self):
     """A corrupt cache must cost us the resume, not the learner."""
-    CP, _, model = self.trained()
-    for k, v in damage.items():
-      setattr(model, k, v)
-    learner = HondaSteeringLearner(CP, dt=DT, learned=model)
-    if "covariance" in damage:
-      # nothing restored: the fit is as open as an unlearned one seeded with these values
-      unrestored = 0.5 * model.lat_accel_factor(20.0) ** 2
-      assert learner.steady_rls.P[0][0] == pytest.approx(unrestored)
-    # whatever was wrong, the gain still resumes and the learner still runs
-    assert learner.steady_rls.theta[0] == pytest.approx(model.lat_accel_factor(20.0))
-    learner.update(HondaSteerSample(t=0.0, v_ego=25.0, torque_cmd=0.3, steering_angle_deg=2.0,
-                                    steering_rate_deg=1.0, lat_active=True, lat_accel=0.8))
+    for damage in [
+      {"bucket_counts": [[1, 2], [3, 4]]},
+      {"bucket_counts": "not a list"},
+      {"covariance": {"steady": [[1.0]]}},
+      {"covariance": {"steady": "nope"}},
+      {"covariance": {"steady": [[float("nan")] * 4] * 4}},
+      {"bucket_counts": [], "covariance": {}},
+    ]:
+      with self.subTest(damage=damage):
+        CP, _, model = self.trained()
+        for k, v in damage.items():
+          setattr(model, k, v)
+        learner = HondaSteeringLearner(CP, dt=DT, learned=model)
+        if "covariance" in damage:
+          # nothing restored: the fit is as open as an unlearned one seeded with these values
+          unrestored = 0.5 * model.lat_accel_factor(20.0) ** 2
+          assert learner.steady_rls.P[0][0] == approx(unrestored)
+        # whatever was wrong, the gain still resumes and the learner still runs
+        assert learner.steady_rls.theta[0] == approx(model.lat_accel_factor(20.0))
+        learner.update(HondaSteerSample(t=0.0, v_ego=25.0, torque_cmd=0.3, steering_angle_deg=2.0,
+                                        steering_rate_deg=1.0, lat_active=True, lat_accel=0.8))
 
 
-class TestNoisyMeasurement:
+class TestNoisyMeasurement(unittest.TestCase):
   """Regression tests for route 729a2e65b1f6201d, where the published gain railed at 8.0.
 
   The fit is oriented with the command as the regressor and the measured lateral
@@ -374,13 +403,14 @@ class TestNoisyMeasurement:
                                       lat_active=True, lat_accel=measured))
     return learner
 
-  @pytest.mark.parametrize("noise,hold_hz", [(0.0, None), (0.3, None), (0.5, 7), (0.8, 7)])
-  def test_noise_does_not_inflate_the_gain(self, noise, hold_hz):
+  def test_noise_does_not_inflate_the_gain(self):
     """The exact conditions of the route: a narrow one-signed band and a stale yaw rate."""
-    m = self.feed(noise=noise, hold_hz=hold_hz).model()
-    assert not m.diverged
-    assert m.lat_accel_factor(22.0) == pytest.approx(2.4, rel=0.15), \
-      f"noise={noise} hold={hold_hz}: gain {m.lat_accel_factor(22.0):.2f}"
+    for noise, hold_hz in [(0.0, None), (0.3, None), (0.5, 7), (0.8, 7)]:
+      with self.subTest(noise=noise, hold_hz=hold_hz):
+        m = self.feed(noise=noise, hold_hz=hold_hz).model()
+        assert not m.diverged
+        assert m.lat_accel_factor(22.0) == approx(2.4, rel=0.15), \
+          f"noise={noise} hold={hold_hz}: gain {m.lat_accel_factor(22.0):.2f}"
 
   def test_a_diverged_fit_is_surfaced_not_masked(self):
     """A diverged fit must not be indistinguishable from an unfitted one."""
@@ -393,7 +423,7 @@ class TestNoisyMeasurement:
     assert m.diverged
     assert not m.valid, "a diverged fit must never be published as converged"
     # with nothing measured, the published gain is the prior - but flagged, not silent
-    assert m.lat_accel_factor(22.0) == pytest.approx(learner.prior.lat_accel_factor(22.0))
+    assert m.lat_accel_factor(22.0) == approx(learner.prior.lat_accel_factor(22.0))
 
   def test_a_railed_secondary_term_is_surfaced_not_masked(self):
     """friction/offset/asymmetry are clipped before publishing same as the gain is - a fit
@@ -410,7 +440,7 @@ class TestNoisyMeasurement:
     # push the asymmetry term well past ASYMMETRY_MAX_VALID; gain is untouched
     learner.steady_rls.theta[3] = -10.0 * learner.steady_rls.theta[0]
     m = learner.model()
-    assert m.asymmetry == pytest.approx(0.5), "still clipped for publishing"
+    assert m.asymmetry == approx(0.5), "still clipped for publishing"
     assert m.diverged, "a fit railed past ASYMMETRY_MAX_VALID must be flagged, not silently clipped"
     assert not m.valid, "a diverged fit must never be published as converged"
 
@@ -424,7 +454,7 @@ class TestNoisyMeasurement:
     # sits right at the publish-clip edge, well inside FRICTION_MIN_VALID/MAX_VALID
     learner.steady_rls.theta[2] = -0.45 * learner.steady_rls.theta[0]
     m = learner.model()
-    assert m.friction == pytest.approx(0.4)
+    assert m.friction == approx(0.4)
     assert not m.diverged, "brushing the publish-clip bound alone must not read as diverged"
 
   def test_divergence_resets_rather_than_persisting(self):
@@ -433,7 +463,7 @@ class TestNoisyMeasurement:
     learner.steady_rls.theta[0] = -0.5
     learner._check_divergence()
     assert learner.resets == before + 1
-    assert learner.steady_rls.theta[0] == pytest.approx(learner.prior.lat_accel_factor(20.0))
+    assert learner.steady_rls.theta[0] == approx(learner.prior.lat_accel_factor(20.0))
 
   def test_a_railed_secondary_term_resets_only_itself(self):
     """A friction/offset/asymmetry divergence must recover, not stay flagged forever - and
@@ -447,8 +477,8 @@ class TestNoisyMeasurement:
     learner._check_divergence()
     assert learner.resets == before + 1
     assert learner.steady_rls.theta[3] == 0.0, "the railed column resets to nothing measured"
-    assert learner.steady_rls.theta[0] == pytest.approx(k_before), "gain is untouched"
-    assert learner.steady_rls.theta[1] == pytest.approx(offset_before), "offset is untouched"
+    assert learner.steady_rls.theta[0] == approx(k_before), "gain is untouched"
+    assert learner.steady_rls.theta[1] == approx(offset_before), "offset is untouched"
     assert not learner.model().diverged, "a reset column is no longer railed"
 
   def test_a_railed_steer_ratio_resets_rather_than_persisting(self):
@@ -462,8 +492,8 @@ class TestNoisyMeasurement:
     learner.update(HondaSteerSample(t=1e6, v_ego=22.0, torque_cmd=0.1, steering_angle_deg=1.0,
                                     steering_rate_deg=0.0, lat_active=True, lat_accel=0.2))
     assert learner.resets == before + 1
-    assert learner.sr_rls.theta[0] == pytest.approx(learner.prior.steer_ratio)
-    assert learner.steer_ratio == pytest.approx(learner.prior.steer_ratio)
+    assert learner.sr_rls.theta[0] == approx(learner.prior.steer_ratio)
+    assert learner.steer_ratio == approx(learner.prior.steer_ratio)
 
   def test_asymmetry_waits_for_both_directions(self):
     """max(u, 0) duplicates the command column while the command is one-signed."""
@@ -513,7 +543,7 @@ class TestNoisyMeasurement:
       learner.update(HondaSteerSample(t=t, v_ego=22.0, torque_cmd=1.0 if saturated else 0.1,
                                       steering_angle_deg=0.0, steering_rate_deg=0.0,
                                       lat_active=True, saturated=saturated))
-    assert learner.model().saturated_fraction == pytest.approx(0.25)
+    assert learner.model().saturated_fraction == approx(0.25)
 
     before = learner.model().saturated_fraction
     for i in range(1000):
@@ -524,10 +554,10 @@ class TestNoisyMeasurement:
       learner.update(HondaSteerSample(t=1000 * DT + i * DT, v_ego=22.0, torque_cmd=1.0,
                                       steering_angle_deg=0.0, steering_rate_deg=0.0,
                                       lat_active=True, steering_pressed=True, saturated=True))
-    assert learner.model().saturated_fraction == pytest.approx(before)
+    assert learner.model().saturated_fraction == approx(before)
 
 
-class TestCovarianceWindup:
+class TestCovarianceWindup(unittest.TestCase):
   def test_no_direction_winds_up_without_data(self):
     """An unexcited direction must not grow until the first sample that touches it lands
     with enormous gain."""
@@ -539,16 +569,17 @@ class TestCovarianceWindup:
     assert np.all(np.diag(rls.P) <= rls.p_max + 1e-9)
 
 
-def test_model_round_trips():
-  CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
-  m = prior_from_car_params(CP)
-  m.valid = True
-  assert HondaSteeringModel.from_json(m.to_json()) == m
-  with pytest.raises(ValueError):
-    HondaSteeringModel.from_dict({"version": 999})
+class TestModelSerialization(unittest.TestCase):
+  def test_model_round_trips(self):
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC_2022)
+    m = prior_from_car_params(CP)
+    m.valid = True
+    assert HondaSteeringModel.from_json(m.to_json()) == m
+    with self.assertRaises(ValueError):
+      HondaSteeringModel.from_dict({"version": 999})
 
 
-class TestRollCompensationGate:
+class TestRollCompensationGate(unittest.TestCase):
   """Roll enters the fitted target as sin(roll)*9.81, so a bad estimate is not a small
   error: on route 729a2e65b1f6201d it had a standard deviation 1.07x the lateral
   acceleration signal itself. The gate rejects an estimate that cannot be road crown; the
@@ -570,7 +601,7 @@ class TestRollCompensationGate:
     settled = learner._lat_accel(self._sample(roll))
     for _ in range(200):                          # let the rate filter settle
       settled = learner._lat_accel(self._sample(roll))
-    assert settled == pytest.approx(0.05 * 20.0 - math.sin(roll) * 9.81, abs=1e-6)
+    assert settled == approx(0.05 * 20.0 - math.sin(roll) * 9.81, abs=1e-6)
     assert learner.roll_comp_applied > 0
 
   def test_an_implausibly_large_roll_is_skipped(self):
@@ -578,7 +609,7 @@ class TestRollCompensationGate:
     learner = self._learner()
     roll = 0.5                                    # 4.7 m/s^2, five times any real crown
     a = learner._lat_accel(self._sample(roll))
-    assert a == pytest.approx(0.05 * 20.0, abs=1e-6), "the compensation must not be applied"
+    assert a == approx(0.05 * 20.0, abs=1e-6), "the compensation must not be applied"
     assert learner.roll_comp_skipped == 1
 
   def test_a_roll_estimate_that_is_still_settling_is_skipped(self):
@@ -595,7 +626,7 @@ class TestRollCompensationGate:
       learner._lat_accel(self._sample(0.02))
     for _ in range(100):
       learner._lat_accel(self._sample(0.5))
-    assert learner.model().roll_comp_fraction == pytest.approx(0.5, abs=0.02)
+    assert learner.model().roll_comp_fraction == approx(0.5, abs=0.02)
 
   def test_both_correlations_are_published(self):
     """The compensated and uncompensated targets are scored against the same command, so
@@ -624,7 +655,7 @@ class TestRollCompensationGate:
     assert m.lat_accel_torque_corr >= m.lat_accel_torque_corr_raw
 
 
-class TestLagIsNotOverclaimed:
+class TestLagIsNotOverclaimed(unittest.TestCase):
   """The dead time is published as a measurement only when it beat the prior.
 
   Fitting (dead time, tau) by output error over route 729a2e65b1f6201d leaves 0.2%

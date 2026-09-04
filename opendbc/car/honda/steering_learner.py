@@ -357,20 +357,15 @@ def prior_from_car_params(CP) -> HondaSteeringModel:
   * the existing hand tune (``kpV``) is used as a weak sanity anchor,
   * the EPS generation flags set the delay prior.
   """
-  # FIXME: this reads an unpopulated torque scale as a real, very small one. The guard is
-  # on the list being empty, but HONDA_CLARITY carries torqueBP=[0], which is non-empty
-  # with a last element of zero, so it takes the branch and gets steer_max=0 rather than
-  # the 4096.0 default. max(steer_max, 1.0) below then floors scale_nudge at 0.8 and the
-  # Clarity ends up with the lowest gain prior in the fleet (1.520) despite being 276 kg
-  # lighter than the Pilot, which is what test_priors_differentiate_platforms is failing
-  # on. It is the only platform affected today, but any car whose lateralParams are not
-  # filled in inherits the same silently wrong prior rather than the default.
-  #
-  # Left alone deliberately: the fix changes what "missing" means for every platform's
-  # prior, and the priors want re-deriving against real routes anyway - route
-  # 729a2e65b1f6201d fits 2.49 against a 2.65 prior on a Civic, which is close, but one
-  # route is not evidence about the fleet. Revisit both together.
-  steer_max = float(CP.lateralParams.torqueBP[-1]) if len(CP.lateralParams.torqueBP) else 4096.0
+  # An unpopulated torque scale has to read as missing, not as a real but very small one.
+  # Guarding only on the list being empty is not enough: HONDA_CLARITY carries
+  # torqueBP=[0], non-empty with a last element of zero, so it took the branch and got
+  # steer_max=0. max(steer_max, 1.0) below then floored scale_nudge at 0.8 and gave the
+  # Clarity the lowest gain prior in the fleet (1.520) despite it being 276 kg lighter
+  # than the Pilot. Any platform whose lateralParams are not filled in inherits the same
+  # silently wrong prior, so the guard is on there being a positive scale to read.
+  torque_bp = CP.lateralParams.torqueBP
+  steer_max = float(torque_bp[-1]) if len(torque_bp) and torque_bp[-1] > 0 else 4096.0
   mass = float(CP.mass) or 1500.0
   fingerprint = str(CP.carFingerprint)
 
