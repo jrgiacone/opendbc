@@ -6,6 +6,7 @@ import numpy as np
 from opendbc.car.honda.interface import CarInterface
 from opendbc.car.honda.lat_controller import HondaAdaptiveLatController
 from opendbc.car.honda.steering_learner import (
+  APPLY_ROLL_COMPENSATION,
   MAX_DELAY,
   MIN_DELAY,
   MIN_TOTAL_POINTS,
@@ -597,14 +598,22 @@ class TestRollCompensationGate(unittest.TestCase):
                             steering_rate_deg=0.0, lat_active=True, yaw_rate=0.05,
                             roll=roll, lat_accel_valid=True, **kw)
 
-  def test_a_plausible_roll_is_applied(self):
+  def test_a_plausible_roll_is_accepted_by_the_gate_but_not_fitted(self):
+    """The gate still accepts a believable crown and the compensated target is still
+    computed for the published correlations - but APPLY_ROLL_COMPENSATION is off, so the
+    value the model is fitted on is the uncompensated one. See the roll notes in
+    steering_learner.py for the route evidence that turned it off."""
     learner = self._learner()
     roll = 0.02                                   # ~1.1 deg of crown, 0.20 m/s^2
     settled = learner._lat_accel(self._sample(roll))
     for _ in range(200):                          # let the rate filter settle
       settled = learner._lat_accel(self._sample(roll))
-    assert settled == approx(0.05 * 20.0 - math.sin(roll) * 9.81, abs=1e-6)
-    assert learner.roll_comp_applied > 0
+
+    assert learner.roll_comp_applied > 0, "a plausible roll must still pass the gate"
+    assert learner._comp_lat_accel == approx(0.05 * 20.0 - math.sin(roll) * 9.81, abs=1e-6)
+
+    assert not APPLY_ROLL_COMPENSATION
+    assert settled == approx(0.05 * 20.0, abs=1e-6), "the fitted target is uncompensated"
 
   def test_an_implausibly_large_roll_is_skipped(self):
     """Superelevation tops out near 10%; anything past that is the estimate, not the road."""

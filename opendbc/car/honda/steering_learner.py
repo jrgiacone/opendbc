@@ -131,11 +131,34 @@ MIN_LAT_ACCEL_SPAN = 1.3
 #   corr(torque_cmd, lat accel - roll comp) +0.114
 #
 # Subtracting it raised the target's variance and cost 40% of the correlation with the
-# command: on that route the compensation carried more error than road roll. So it is
-# applied only where the estimate is quiet enough to believe, and the crown it leaves
-# behind is picked up by ``offset``, which is what that term is for. Both correlations
-# are tracked and published so the fleet answers this with data rather than with one
-# route's numbers.
+# command: on that route the compensation carried more error than road roll. Both
+# correlations are tracked and published so the fleet answers this with data rather than
+# with one route's numbers.
+#
+# Route 729a2e65b1f6201d/00000012 answered it, over 92325 gated samples:
+#
+#   corr(roll comp, lat accel)   -0.442   anti-correlated with the target
+#   corr(roll comp, torque cmd)  -0.054   but not with the command
+#   sigma(lat accel - comp)      1.43x sigma(lat accel)
+#
+# Because the compensation is anti-correlated with the target and carries no command
+# information, subtracting it amplifies the target's variance instead of removing a
+# disturbance. Held out against the hand tuned prior it is decisive - the fit goes from
+# losing by 13%/3% (at a 0.25/0.5 fit split) to winning by 11%/15% with it removed - and
+# it accounts for 78% of cold start divergences, since the crown it fails to remove lands
+# in ``offset``, which then rails: 205 resets over one drive become 16 without it.
+#
+# Flipping its sign was tested too, in case road roll simply was not in the learner's
+# frame after the yaw rate was flipped; that is worse still (losing by 11%/20%), so this
+# is not a frame error. The cause is that paramsd derives road roll from the same IMU
+# specific force that carries the lateral acceleration being fitted - the two are not
+# separable, so it is not an independent measurement and cannot correct this target.
+# It stays correct where openpilot uses it (feedforward on the *desired* lateral
+# acceleration, latcontrol_torque.py), which is not this.
+#
+# The estimate is still computed, gated and published as evidence - the fleet keeps
+# scoring both targets - it is simply no longer the one the model is fitted on.
+APPLY_ROLL_COMPENSATION = False
 # Superelevation on ordinary roads tops out near 10%, i.e. sin(0.1)*9.81 = 0.98 m/s^2.
 # A compensation larger than that is not road crown, it is the estimate.
 MAX_ROLL_COMPENSATION = 1.0
@@ -628,6 +651,7 @@ class HondaSteeringLearner:
     # roll compensation bookkeeping and the evidence for whether it is worth applying
     self._roll_filt: float | None = None
     self._raw_lat_accel = 0.0
+    self._comp_lat_accel = 0.0
     self.roll_comp_applied = 0
     self.roll_comp_skipped = 0
     # evidence for whether max_useful_torque is limiting real driving; see update()
@@ -739,7 +763,12 @@ class HondaSteeringLearner:
     return comp
 
   def _lat_accel(self, s: HondaSteerSample) -> float:
-    """Measured lateral acceleration, roll compensated, from the best source available."""
+    """Measured lateral acceleration from the best source available.
+
+    The roll compensated value is still computed, gated and kept for the published
+    correlations, but ``APPLY_ROLL_COMPENSATION`` decides which of the two the model is
+    actually fitted on - see the roll compensation notes at the top of this module.
+    """
     if s.lat_accel is not None:
       a = s.lat_accel
     elif s.yaw_rate is not None:
@@ -748,7 +777,8 @@ class HondaSteeringLearner:
       curvature = math.radians(s.steering_angle_deg) / (self.steer_ratio * self.wheelbase)
       a = curvature * s.v_ego ** 2
     self._raw_lat_accel = float(a)
-    return float(a - self._roll_compensation(s))
+    self._comp_lat_accel = float(a - self._roll_compensation(s))
+    return self._comp_lat_accel if APPLY_ROLL_COMPENSATION else self._raw_lat_accel
 
   # -- main ---------------------------------------------------------------------------
   def update(self, s: HondaSteerSample) -> None:
@@ -853,7 +883,9 @@ class HondaSteeringLearner:
     if abs(lat_jerk) <= STEADY_JERK:
       # the same samples the static model is fitted on, scored both ways: whichever
       # target tracks the command better is the one the fit should be using
-      self.corr_compensated.update(torque_cmd, lat_accel)
+      # both targets stay scored regardless of which one is fitted, so the comparison
+      # that produced APPLY_ROLL_COMPENSATION keeps running on the fleet
+      self.corr_compensated.update(torque_cmd, self._comp_lat_accel)
       self.corr_raw.update(torque_cmd, self._raw_lat_accel)
       self.steady_rls.update(x_static, lat_accel)
       self.speed_rls[i_speed].update(x_static, lat_accel)
